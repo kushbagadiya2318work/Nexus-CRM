@@ -1,10 +1,10 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "version": 2,
-  "buildCommand": "npm run build",
+  "buildCommand": "npm run build && ls -la dist",
   "outputDirectory": "dist",
   "installCommand": "npm install",
-  "framework": "vite",
+  "framework": null,
   "functions": {
     "api/index.js": {
       "memory": 512,
