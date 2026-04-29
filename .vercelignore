@@ -1,7 +1,0 @@
-node_modules
-.env
-.env.*
-!.env.example
-backend/node_modules
-backend/.env
-LEAD-MANAGEMENT-SETUP.md
