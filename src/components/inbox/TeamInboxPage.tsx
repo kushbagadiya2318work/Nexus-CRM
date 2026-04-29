@@ -19,13 +19,12 @@ import {
   Inbox,
   Mail,
   MessageSquare,
-  Mic,
   Phone,
   Search,
   Shield,
   Users,
 } from 'lucide-react'
-import { Card, CardContent, CardHeader } from '@/components/ui/card'
+import { Card, CardContent } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Badge } from '@/components/ui/badge'
@@ -462,9 +461,6 @@ export function TeamInboxPage() {
   }, [filtered])
 
   const totalInteractions = allEntries.length
-  const companiesWithMultiRep = useMemo(() => {
-    return [...new Map<string, Set<string>>().entries()].length // placeholder
-  }, [])
 
   // Count companies with multiple reps
   const multiRepCount = useMemo(() => {

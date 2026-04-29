@@ -107,12 +107,40 @@ const store = {
 
 let roundRobinIndex = 0
 
+// Build a list of allowed CORS origins. In Vercel, the frontend lives on the
+// same origin as the API so credentialed same-origin requests are allowed by
+// default; explicit origins are still honoured for local development and any
+// extra hosts configured via FRONTEND_URL (comma-separated).
+const allowedOrigins = new Set(
+  [
+    process.env.FRONTEND_URL,
+    process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : null,
+    'http://localhost:5173',
+    'http://localhost:4173',
+  ]
+    .filter(Boolean)
+    .flatMap((value) => String(value).split(',').map((entry) => entry.trim()))
+    .filter(Boolean)
+)
+
 app.use(helmet())
-app.use(cors({ origin: process.env.FRONTEND_URL || 'http://localhost:5173', credentials: true }))
+app.use(
+  cors({
+    origin(origin, callback) {
+      // Allow same-origin / non-browser requests (no Origin header)
+      if (!origin) return callback(null, true)
+      if (allowedOrigins.has(origin)) return callback(null, true)
+      return callback(null, false)
+    },
+    credentials: true,
+  })
+)
 app.use(express.json({ limit: '2mb' }))
 app.use(express.urlencoded({ extended: true }))
 app.use(cookieParser())
-app.use(morgan('dev'))
+if (process.env.NODE_ENV !== 'production') {
+  app.use(morgan('dev'))
+}
 
 const authSchema = z.object({
   email: z.string().email(),
@@ -943,23 +971,54 @@ app.use((error, _req, res, _next) => {
   return res.status(500).json({ message: 'Internal server error' })
 })
 
-async function connectMongo() {
+// Cached Mongo connection promise so concurrent serverless invocations only
+// trigger a single connection attempt during cold start.
+let mongoConnectionPromise = null
+
+export async function connectMongo() {
   if (!process.env.MONGO_URI) {
-    console.warn('No MONGO_URI provided. Running in demo fallback mode.')
-    return
+    if (!global.__mongoFallbackWarned) {
+      console.warn('No MONGO_URI provided. Running in demo fallback mode.')
+      global.__mongoFallbackWarned = true
+    }
+    return null
   }
 
-  try {
-    await mongoose.connect(process.env.MONGO_URI)
-    console.log('MongoDB connected')
-  } catch (error) {
-    console.warn('MongoDB connection failed. Continuing in demo fallback mode.')
-    console.warn(error.message)
+  if (mongoose.connection.readyState === 1) {
+    return mongoose.connection
   }
+
+  if (!mongoConnectionPromise) {
+    mongoConnectionPromise = mongoose
+      .connect(process.env.MONGO_URI, { serverSelectionTimeoutMS: 5000 })
+      .then((conn) => {
+        console.log('MongoDB connected')
+        return conn
+      })
+      .catch((error) => {
+        console.warn('MongoDB connection failed. Continuing in demo fallback mode.')
+        console.warn(error.message)
+        mongoConnectionPromise = null
+        return null
+      })
+  }
+
+  return mongoConnectionPromise
 }
 
-connectMongo().then(() => {
+// Kick off Mongo connection on module load (non-blocking) so the first request
+// does not pay the full latency.
+connectMongo()
+
+// Only start the HTTP listener when running as a standalone Node process.
+// In Vercel (and other serverless platforms) the platform will import the app
+// and invoke it directly, so we must not bind to a port.
+const isServerless = Boolean(process.env.VERCEL) || process.env.SERVERLESS === '1'
+
+if (!isServerless) {
   app.listen(PORT, () => {
     console.log(`Lead management API listening on http://localhost:${PORT}`)
   })
-})
+}
+
+export default app

@@ -1,4 +1,9 @@
-const API_BASE_URL = import.meta.env.VITE_CRM_API_URL || 'http://localhost:4000/api'
+// In production (Vercel) the backend is served from the same origin under
+// `/api`, so we default to a relative path. For local development, point
+// `VITE_CRM_API_URL` at the standalone Express server (e.g. http://localhost:4000/api).
+const API_BASE_URL =
+  import.meta.env.VITE_CRM_API_URL ||
+  (import.meta.env.DEV ? 'http://localhost:4000/api' : '/api')
 const DEMO_LOGIN = {
   email: 'manager@nexuscrm.ai',
   password: 'demo123',

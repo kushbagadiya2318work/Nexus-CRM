@@ -46,7 +46,7 @@ import { useCRMStore } from '@/store'
 import { formatCurrency, formatDate } from '@/lib/utils'
 import { CommentThread } from '@/components/ui/comment-thread'
 import { QuoteBuilder } from './QuoteBuilder'
-import type { Deal } from '@/types'
+import type { Deal, User } from '@/types'
 
 // ── Types ──────────────────────────────────────────────────────────────────────
 type Stage = Deal['stage']
@@ -160,14 +160,14 @@ function DealCard({
   compact = false,
 }: {
   deal: Deal
-  users: ReturnType<typeof useCRMStore>['users']
+  users: User[]
   onEdit: (deal: Deal) => void
   onDelete: (id: string) => void
   onStageChange: (id: string, stage: Stage) => void
   onQuote: (deal: Deal) => void
   compact?: boolean
 }) {
-  const assignee = users.find((u) => u.id === deal.assignedTo)
+  const assignee = users.find((u: User) => u.id === deal.assignedTo)
   const stale = isStale(deal)
   const closingSoon = isClosingSoon(deal)
   const overdueClose = isOverdueClose(deal)

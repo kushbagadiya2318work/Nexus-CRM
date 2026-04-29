@@ -1,10 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
-import { motion, AnimatePresence } from 'framer-motion'
 import {
-  BadgeDollarSign,
   Check,
-  ChevronDown,
-  Clock,
   Copy,
   FileSignature,
   FileText,
@@ -13,7 +9,6 @@ import {
   Plus,
   Printer,
   Send,
-  Trash2,
   X,
 } from 'lucide-react'
 import {
