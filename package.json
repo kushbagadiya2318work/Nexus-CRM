@@ -7,6 +7,7 @@
     "dev": "vite",
     "dev:api": "node --watch backend/src/server.js",
     "build": "tsc && vite build",
+    "postbuild": "node -e \"const fs=require('fs');const p=require('path');console.log('=== POSTBUILD DIAGNOSTIC ===');console.log('cwd:',process.cwd());console.log('contents:',fs.readdirSync('.').join(', '));['dist','build'].forEach(d=>{if(fs.existsSync(d)){console.log(d+'/ exists, contains:',fs.readdirSync(d).join(', '))}else{console.log(d+'/ does NOT exist')}});\"",
     "preview": "vite preview"
   },
   "dependencies": {
