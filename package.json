@@ -7,8 +7,7 @@
     "dev": "vite",
     "dev:api": "node --watch backend/src/server.js",
     "build": "tsc && vite build",
-    "preview": "vite preview",
-    "vercel-build": "tsc && vite build"
+    "preview": "vite preview"
   },
   "dependencies": {
     "bcryptjs": "^2.4.3",
