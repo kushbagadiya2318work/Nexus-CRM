@@ -3,7 +3,7 @@
   "framework": "vite",
   "installCommand": "npm install",
   "buildCommand": "npm run build",
-  "outputDirectory": "dist",
+  "outputDirectory": "vercel-output",
   "rewrites": [
     {
       "source": "/api/(.*)",
