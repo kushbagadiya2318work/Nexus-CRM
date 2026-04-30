@@ -15,9 +15,10 @@ import { AIInsightsPage } from '@/components/ai/AIInsightsPage'
 import { IntegrationsPage } from '@/components/integrations/IntegrationsPage'
 import { WorkflowsPage } from '@/components/workflows/WorkflowsPage'
 import { TeamInboxPage } from '@/components/inbox/TeamInboxPage'
+import { AutomationBlueprintPage } from '@/components/automation/AutomationBlueprintPage'
 
 function App() {
-  const { isAuthenticated, setCurrentUser } = useCRMStore()
+  const { isAuthenticated, setCurrentUser, hydrateCRMData } = useCRMStore()
 
   useEffect(() => {
     // Check for stored auth on mount
@@ -26,9 +27,10 @@ function App() {
       const parsed = JSON.parse(stored)
       if (parsed.state?.currentUser) {
         setCurrentUser(parsed.state.currentUser)
+        void hydrateCRMData()
       }
     }
-  }, [setCurrentUser])
+  }, [hydrateCRMData, setCurrentUser])
 
   if (!isAuthenticated) {
     return <LoginPage />
@@ -46,6 +48,7 @@ function App() {
         <Route path="/analytics" element={<AnalyticsPage />} />
         <Route path="/ai-insights" element={<AIInsightsPage />} />
         <Route path="/integrations" element={<IntegrationsPage />} />
+        <Route path="/automation" element={<AutomationBlueprintPage />} />
         <Route path="/workflows" element={<WorkflowsPage />} />
         <Route path="/inbox" element={<TeamInboxPage />} />
         <Route path="*" element={<Navigate to="/" replace />} />

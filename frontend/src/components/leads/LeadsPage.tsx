@@ -286,7 +286,7 @@ export function LeadsPage() {
     setFormState((current) => ({ ...current, [field]: value }))
   }
 
-  const saveLead = () => {
+  const saveLead = async () => {
     if (!formState.name.trim() || (!formState.phone.trim() && !formState.email.trim())) {
       setActivityMessage('Add a lead name and at least one contact method before saving.')
       return
@@ -374,8 +374,7 @@ export function LeadsPage() {
         automation: { autoAssigned: true, lastWorkflow: 'new-lead-welcome', chatbotEnabled: true },
       }
 
-      addLead(newLead)
-      void createLeadInApi({
+      const persisted = await createLeadInApi({
         name: newLead.name,
         email: newLead.email,
         phone: newLead.phone,
@@ -389,6 +388,7 @@ export function LeadsPage() {
         requiredSkill: newLead.requiredSkill,
         tags: newLead.tags,
       })
+      addLead(((persisted as { data?: Lead } | null)?.data as Lead | undefined) || newLead)
       setActivityMessage(
         `${newLead.name} was captured, assigned to ${newLead.assignedUserName}, and added to the follow-up queue.`
       )

@@ -13,7 +13,15 @@ export function IntegrationsPage() {
   const [metaPageId, setMetaPageId] = useState('')
   const [metaVerifyToken, setMetaVerifyToken] = useState('')
   const [statusMessage, setStatusMessage] = useState('Fill in your Meta credentials and save them for local setup.')
-  const [integrationStatus, setIntegrationStatus] = useState({ metaAds: false, whatsapp: false, calling: false })
+  const [integrationStatus, setIntegrationStatus] = useState({
+    metaAds: false,
+    whatsapp: false,
+    sms: false,
+    email: false,
+    slack: false,
+    sync: false,
+    calling: false,
+  })
 
   useEffect(() => {
     const saved = window.localStorage.getItem(storageKey)
@@ -26,7 +34,7 @@ export function IntegrationsPage() {
 
     fetchIntegrationStatus().then((result) => {
       if (result?.data) {
-        setIntegrationStatus(result.data as { metaAds: false; whatsapp: false; calling: false })
+        setIntegrationStatus(result.data as typeof integrationStatus)
       }
     })
   }, [])
@@ -46,7 +54,7 @@ export function IntegrationsPage() {
         <p className="text-muted">Connect Meta Ads, WhatsApp, and your calling provider from one place.</p>
       </div>
 
-      <div className="grid gap-4 md:grid-cols-3">
+      <div className="grid gap-4 md:grid-cols-3 xl:grid-cols-7">
         <Card>
           <CardContent className="p-4">
             <div className="mb-2 flex items-center gap-2">
@@ -74,7 +82,58 @@ export function IntegrationsPage() {
             <p className="text-sm text-muted">{integrationStatus.calling ? 'Connected in backend' : 'Awaiting backend credentials'}</p>
           </CardContent>
         </Card>
+        <Card>
+          <CardContent className="p-4">
+            <div className="mb-2 flex items-center gap-2">
+              <Radio className="h-4 w-4 text-emerald-500" />
+              <p className="font-medium">SMS</p>
+            </div>
+            <p className="text-sm text-muted">{integrationStatus.sms ? 'Connected in backend' : 'Awaiting backend credentials'}</p>
+          </CardContent>
+        </Card>
+        <Card>
+          <CardContent className="p-4">
+            <div className="mb-2 flex items-center gap-2">
+              <Webhook className="h-4 w-4 text-cyan-500" />
+              <p className="font-medium">Email</p>
+            </div>
+            <p className="text-sm text-muted">{integrationStatus.email ? 'Connected in backend' : 'Awaiting backend credentials'}</p>
+          </CardContent>
+        </Card>
+        <Card>
+          <CardContent className="p-4">
+            <div className="mb-2 flex items-center gap-2">
+              <MessageCircle className="h-4 w-4 text-violet-500" />
+              <p className="font-medium">Slack</p>
+            </div>
+            <p className="text-sm text-muted">{integrationStatus.slack ? 'Connected in backend' : 'Awaiting webhook URL'}</p>
+          </CardContent>
+        </Card>
+        <Card>
+          <CardContent className="p-4">
+            <div className="mb-2 flex items-center gap-2">
+              <Link2 className="h-4 w-4 text-primary" />
+              <p className="font-medium">Zapier/Make</p>
+            </div>
+            <p className="text-sm text-muted">{integrationStatus.sync ? 'Realtime sync enabled' : 'No outbound sync webhook yet'}</p>
+          </CardContent>
+        </Card>
       </div>
+
+      <Card>
+        <CardHeader>
+          <CardTitle>Production connection checklist</CardTitle>
+          <CardDescription>Use these environment-backed integrations for real lead automation.</CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-2 text-sm text-muted">
+          <p>`MONGO_URI` stores persistent leads, follow-up history, and analytics data.</p>
+          <p>`WHATSAPP_ACCESS_TOKEN` + `WHATSAPP_PHONE_NUMBER_ID` enable instant replies and follow-ups.</p>
+          <p>`TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, and `TWILIO_PHONE_NUMBER` enable SMS and call workflows.</p>
+          <p>`LEAD_EMAIL_WEBHOOK_URL` powers transactional lead-response emails through your preferred provider.</p>
+          <p>`SLACK_WEBHOOK_URL` sends hot-lead alerts to the sales team.</p>
+          <p>`ZAPIER_WEBHOOK_URL` or `MAKE_WEBHOOK_URL` keeps downstream tools in sync in real time.</p>
+        </CardContent>
+      </Card>
 
       <Card>
         <CardHeader>

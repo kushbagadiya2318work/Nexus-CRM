@@ -5,8 +5,8 @@ import { Input } from '@/components/ui/input'
 import { useCRMStore } from '@/store'
 
 export function LoginPage() {
-  const [email, setEmail] = useState('demo@nexus.com')
-  const [password, setPassword] = useState('demo')
+  const [email, setEmail] = useState('')
+  const [password, setPassword] = useState('')
   const [showPassword, setShowPassword] = useState(false)
   const [error, setError] = useState('')
   const [isLoading, setIsLoading] = useState(false)
@@ -20,7 +20,7 @@ export function LoginPage() {
     try {
       const success = await login(email, password)
       if (!success) {
-        setError('Invalid credentials. Try demo@nexus.com / demo')
+        setError('Invalid email or password.')
       }
     } catch (err) {
       setError('An error occurred. Please try again.')
@@ -92,9 +92,6 @@ export function LoginPage() {
             </Button>
           </form>
 
-          <div className="mt-6 text-center text-sm text-muted">
-            <p>Demo credentials: demo@nexus.com / demo</p>
-          </div>
         </div>
 
         {/* Features */}

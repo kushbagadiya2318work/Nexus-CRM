@@ -20,7 +20,7 @@ const quickActions = [
 ]
 
 export function AIAssistantPanel({ isOpen, onToggle }: AIAssistantPanelProps) {
-  const { chatMessages, addChatMessage } = useCRMStore()
+  const { chatMessages, addChatMessage, leads, deals, users } = useCRMStore()
   const [input, setInput] = useState('')
   const [isTyping, setIsTyping] = useState(false)
   const scrollRef = useRef<HTMLDivElement>(null)
@@ -63,73 +63,63 @@ export function AIAssistantPanel({ isOpen, onToggle }: AIAssistantPanelProps) {
     const lowerQuery = query.toLowerCase()
 
     if (lowerQuery.includes('hot lead')) {
-      return `I found 3 hot leads with high engagement scores:
+      const hotLeads = leads
+        .filter((lead) => (lead.score || 0) >= 80 || lead.priority === 'high')
+        .sort((a, b) => (b.score || 0) - (a.score || 0))
+        .slice(0, 5)
 
-1. **Acme Corporation** - 85% engagement, last active 2 hours ago
-2. **TechCorp Industries** - 78% engagement, viewed pricing page 5 times
-3. **Global Systems** - 72% engagement, opened proposal email
+      if (!hotLeads.length) {
+        return 'No hot leads are currently in the CRM. Once lead scores or high-priority records arrive, I will surface them here.'
+      }
 
-Would you like me to draft personalized follow-up emails for any of these?`
+      return `Hot leads from your live CRM:\n\n${hotLeads.map((lead, index) => {
+        const owner = users.find((user) => user.id === lead.assignedTo)?.name || lead.assignedUserName || 'Unassigned'
+        return `${index + 1}. **${lead.name}** - ${lead.company}, score ${lead.score || 0}, owner: ${owner}`
+      }).join('\n')}`
     }
 
     if (lowerQuery.includes('forecast')) {
-      return `Based on your current pipeline analysis:
+      const openDeals = deals.filter((deal) => !['closed-won', 'closed-lost'].includes(deal.stage))
+      const weightedForecast = openDeals.reduce((total, deal) => total + (deal.value * deal.probability) / 100, 0)
+      const atRisk = openDeals.filter((deal) => new Date(deal.expectedCloseDate).getTime() < Date.now())
 
-**January 2024 Forecast:**
-- Expected Revenue: $425,000
-- Confidence: 78%
-- At-risk deals: 3 ($85,000)
-
-**Key Insights:**
-- 5 deals in negotiation stage likely to close
-- 2 deals stalled for more than 10 days and need attention
-- Recommended action: Schedule follow-ups with stalled deals`
+      return `Live forecast:\n\n- Open deals: ${openDeals.length}\n- Weighted forecast: $${Math.round(weightedForecast).toLocaleString()}\n- At-risk deals: ${atRisk.length}\n\n${atRisk.length ? 'Recommended action: update close dates or schedule follow-ups for overdue opportunities.' : 'No overdue open deals are currently visible.'}`
     }
 
     if (lowerQuery.includes('pipeline')) {
-      return `**Pipeline Analysis:**
+      const totalValue = deals.reduce((total, deal) => total + deal.value, 0)
+      const stages = ['prospecting', 'qualification', 'proposal', 'negotiation', 'closed-won', 'closed-lost']
 
-- Total Deals: 156
-- Total Value: $2.4M
-- Average Deal Size: $15,400
-
-**Stage Breakdown:**
-- Prospecting: 245 deals ($1.2M)
-- Qualification: 156 deals ($890K)
-- Proposal: 89 deals ($520K)
-- Negotiation: 45 deals ($280K)
-- Closed Won: 28 deals ($175K)
-
-**Conversion Rates:**
-- Prospect to Qualify: 63.7%
-- Qualify to Proposal: 57.1%
-- Proposal to Negotiation: 50.6%`
+      return `Pipeline analysis from live deals:\n\n- Total deals: ${deals.length}\n- Total value: $${Math.round(totalValue).toLocaleString()}\n\n${stages.map((stage) => {
+        const stageDeals = deals.filter((deal) => deal.stage === stage)
+        const value = stageDeals.reduce((total, deal) => total + deal.value, 0)
+        return `- ${stage.replace('-', ' ')}: ${stageDeals.length} deals ($${Math.round(value).toLocaleString()})`
+      }).join('\n')}`
     }
 
     if (lowerQuery.includes('email')) {
-      return `I've drafted a follow-up email for your top leads:
+      const lead = leads.find((item) => item.status !== 'converted') || leads[0]
+      const recipientName = lead?.name || '[Name]'
+      const companyName = lead?.company || '[Company]'
+
+      return `Follow-up draft:
 
 ---
 
 **Subject:** Quick follow-up on our conversation
 
-Hi [Name],
+Hi ${recipientName},
 
-I hope this email finds you well. I wanted to follow up on our recent conversation about [Company]'s goals for [quarter/year].
+I wanted to follow up on our recent conversation about ${companyName}'s goals.
 
-Based on our discussion, I believe our solution can help you:
-- Reduce operational costs by 25%
-- Increase team productivity by 40%
-- Streamline your workflow processes
+Based on your current priorities, I can share a concise plan, pricing context, or a quick walkthrough with the right next steps.
 
 Would you be available for a 15-minute call this week to discuss how we can support your objectives?
 
 Best regards,
 [Your Name]
 
----
-
-Would you like me to personalize this for specific leads?`
+---`
     }
 
     return `I'm here to help you with your sales activities. I can:

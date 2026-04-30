@@ -9,96 +9,30 @@ import cookieParser from 'cookie-parser'
 import mongoose from 'mongoose'
 import { z } from 'zod'
 import { randomUUID } from 'node:crypto'
-import { ActivityLog } from './models/index.js'
-import { fetchMetaLead, getIntegrationStatus, sendWhatsAppTemplate, transcribeRecording, triggerClickToCall } from './services/integrations.js'
+import { ActivityLog, Client, Deal, Lead, Task, User } from './models/index.js'
+import {
+  fetchMetaLead,
+  getIntegrationStatus,
+  notifySlack,
+  sendEmailMessage,
+  sendSmsMessage,
+  sendWhatsAppTemplate,
+  syncLeadToAutomationPlatforms,
+  transcribeRecording,
+  triggerClickToCall,
+} from './services/integrations.js'
 
 const app = express()
 const PORT = Number(process.env.PORT || 4000)
 const ACCESS_SECRET = process.env.JWT_ACCESS_SECRET || 'dev-access-secret'
 const REFRESH_SECRET = process.env.JWT_REFRESH_SECRET || 'dev-refresh-secret'
 
-const demoUsers = [
-  {
-    id: 'u1',
-    name: 'Sarah Chen',
-    email: 'manager@nexuscrm.ai',
-    passwordHash: bcrypt.hashSync('demo123', 10),
-    role: 'manager',
-    status: 'active',
-    department: 'enterprise',
-    skills: ['enterprise', 'closing', 'strategy'],
-    maxActiveLeads: 6,
-    isAvailable: true,
-  },
-  {
-    id: 'u2',
-    name: 'Mike Ross',
-    email: 'sales@nexuscrm.ai',
-    passwordHash: bcrypt.hashSync('demo123', 10),
-    role: 'sales',
-    status: 'active',
-    department: 'inbound',
-    skills: ['meta_ads', 'whatsapp', 'demo'],
-    maxActiveLeads: 5,
-    isAvailable: true,
-  },
-  {
-    id: 'u3',
-    name: 'Emma Davis',
-    email: 'emma@nexuscrm.ai',
-    passwordHash: bcrypt.hashSync('demo123', 10),
-    role: 'sales',
-    status: 'active',
-    department: 'outbound',
-    skills: ['ivr', 'email', 'follow_up'],
-    maxActiveLeads: 4,
-    isAvailable: true,
-  },
-]
-
 const store = {
-  leads: [
-    {
-      id: 'lead-1',
-      name: 'Robert Johnson',
-      phone: '+15550123',
-      email: 'robert@techcorp.com',
-      company: 'TechCorp Industries',
-      source: 'meta_ads',
-      status: 'new',
-      assignedTo: 'u2',
-      assignedUserName: 'Mike Ross',
-      score: 91,
-      value: 125000,
-      notes: 'Captured via Meta lead form and auto-assigned.',
-      lastActivity: new Date().toISOString(),
-      createdAt: new Date().toISOString(),
-      lastContacted: new Date().toISOString(),
-      priority: 'high',
-      tags: ['meta_ads', 'hot'],
-      nextFollowUp: new Date(Date.now() + 1000 * 60 * 60 * 24).toISOString(),
-      callLogs: [],
-      messages: [],
-      timeline: [],
-      automation: { autoAssigned: true, lastWorkflow: 'new-lead-welcome', chatbotEnabled: true },
-    },
-  ],
-  clients: [
-    {
-      id: 'client-seed-1',
-      name: 'William Taylor',
-      email: 'william@enterprise.com',
-      phone: '+15551111',
-      company: 'Enterprise Solutions Inc',
-      industry: 'Technology',
-      status: 'active',
-      lifetimeValue: 450000,
-      totalDeals: 5,
-      tags: ['enterprise', 'vip'],
-      lastContact: new Date().toISOString(),
-      createdAt: new Date().toISOString(),
-    },
-  ],
+  users: [],
+  leads: [],
+  clients: [],
+  deals: [],
+  tasks: [],
   calls: [],
   messages: [],
   activities: [],
@@ -161,6 +95,23 @@ const leadPayloadSchema = z.object({
   department: z.string().optional(),
   requiredSkill: z.string().optional(),
   tags: z.union([z.array(z.string()), z.string()]).optional(),
+  budget: z.number().nonnegative().optional(),
+  interestLevel: z.enum(['low', 'medium', 'high']).optional(),
+  engagementLevel: z.enum(['low', 'medium', 'high']).optional(),
+  preferredChannels: z.array(z.enum(['email', 'sms', 'whatsapp'])).optional(),
+  location: z.object({
+    city: z.string().optional(),
+    state: z.string().optional(),
+    country: z.string().optional(),
+    address: z.string().optional(),
+  }).optional(),
+  consent: z.object({
+    termsAccepted: z.boolean().optional(),
+    marketingOptIn: z.boolean().optional(),
+    privacyAcceptedAt: z.string().optional(),
+    captureMethod: z.string().optional(),
+  }).optional(),
+  sourceMeta: z.record(z.any()).optional(),
 })
 
 const leadSchema = leadPayloadSchema.refine((value) => Boolean(value.phone || value.email), {
@@ -198,14 +149,92 @@ const clientUpdateSchema = z.object({
   lastContactChannel: z.enum(['call', 'whatsapp', 'email', 'note', 'system']).optional(),
 }).partial()
 
+const clientPayloadSchema = z.object({
+  name: z.string().min(1),
+  email: z.string().email(),
+  phone: z.string().optional(),
+  company: z.string().min(1),
+  industry: z.string().optional(),
+  address: z.string().optional(),
+  website: z.string().optional(),
+  status: z.enum(['active', 'inactive', 'churned']).default('active'),
+  segment: z.enum(['startup', 'smb', 'enterprise', 'vip']).optional(),
+  accountOwnerId: z.string().optional(),
+  accountOwnerName: z.string().optional(),
+  healthScore: z.number().min(0).max(100).optional(),
+  renewalDate: z.string().optional(),
+  lastContactChannel: z.enum(['call', 'whatsapp', 'email', 'note', 'system']).optional(),
+  lifetimeValue: z.number().nonnegative().default(0),
+  totalDeals: z.number().int().nonnegative().default(0),
+  tags: z.array(z.string()).default([]),
+  notes: z.string().optional(),
+  lastContact: z.string().optional(),
+  callLogs: z.array(z.any()).optional(),
+  messages: z.array(z.any()).optional(),
+  timeline: z.array(z.any()).optional(),
+})
+
+const dealPayloadSchema = z.object({
+  name: z.string().min(1),
+  clientId: z.string().optional(),
+  clientName: z.string().min(1).default('Unassigned'),
+  value: z.number().nonnegative(),
+  stage: z.enum(['prospecting', 'qualification', 'proposal', 'negotiation', 'closed-won', 'closed-lost']).default('prospecting'),
+  probability: z.number().min(0).max(100).default(20),
+  expectedCloseDate: z.string(),
+  actualCloseDate: z.string().optional(),
+  assignedTo: z.string().optional(),
+  description: z.string().optional(),
+  activities: z.array(z.any()).default([]),
+  stageMovedAt: z.string().optional(),
+  lostReason: z.string().optional(),
+  nextFollowUp: z.string().optional(),
+  tags: z.array(z.string()).default([]),
+  priority: z.enum(['low', 'medium', 'high']).default('medium'),
+  comments: z.array(z.any()).optional(),
+})
+
+const taskPayloadSchema = z.object({
+  title: z.string().min(1),
+  description: z.string().optional(),
+  status: z.enum(['pending', 'in-progress', 'completed', 'cancelled']).default('pending'),
+  priority: z.enum(['low', 'medium', 'high']).default('medium'),
+  dueDate: z.string(),
+  assignedTo: z.string().optional(),
+  relatedTo: z.object({
+    type: z.enum(['lead', 'client', 'deal']),
+    id: z.string(),
+    name: z.string(),
+  }).optional(),
+  completedAt: z.string().optional(),
+  overdueReason: z.string().optional(),
+  overdueNotifiedAt: z.string().optional(),
+  comments: z.array(z.any()).optional(),
+})
+
 function sanitizeUser(user) {
   const { passwordHash, ...safeUser } = user
   return safeUser
 }
 
+function serializeUser(record) {
+  const user = plainify(record)
+  if (!user) {
+    return null
+  }
+
+  user.id = String(user._id || user.id)
+  user.createdAt = user.createdAt || new Date().toISOString()
+  user.lastActive = user.lastActive || user.updatedAt || user.createdAt
+  delete user.passwordHash
+  delete user._id
+  delete user.__v
+  return user
+}
+
 function issueTokens(user) {
   const payload = {
-    sub: user.id,
+    sub: user.id || String(user._id),
     email: user.email,
     role: user.role,
     name: user.name,
@@ -244,23 +273,77 @@ function requireRoles(...roles) {
   }
 }
 
-function getActiveLeadLoad(userId) {
+function isMongoReady() {
+  return mongoose.connection.readyState === 1
+}
+
+async function ensureBootstrapAdmin() {
+  const email = process.env.ADMIN_EMAIL
+  const password = process.env.ADMIN_PASSWORD
+  if (!email || !password || !isMongoReady()) {
+    return null
+  }
+
+  const existing = await User.findOne({ email: email.toLowerCase() })
+  if (existing) {
+    return serializeUser(existing)
+  }
+
+  const user = await User.create({
+    name: process.env.ADMIN_NAME || 'CRM Admin',
+    email: email.toLowerCase(),
+    passwordHash: bcrypt.hashSync(password, 12),
+    role: 'admin',
+    status: 'active',
+    department: 'enterprise',
+    skills: ['admin'],
+    maxActiveLeads: 100,
+    isAvailable: true,
+    lastActive: new Date(),
+  })
+
+  return serializeUser(user)
+}
+
+async function listUsers() {
+  if (isMongoReady()) {
+    await ensureBootstrapAdmin()
+    const users = await User.find({ status: 'active' }).sort({ createdAt: 1 }).lean()
+    return users.map(serializeUser)
+  }
+
+  return store.users
+}
+
+async function getActiveLeadLoad(userId) {
+  if (isMongoReady()) {
+    return Lead.countDocuments({
+      assignedTo: userId,
+      status: { $nin: ['converted', 'won', 'lost', 'not_interested'] },
+    })
+  }
+
   return store.leads.filter((lead) => {
     return lead.assignedTo === userId && !['converted', 'won', 'lost', 'not_interested'].includes(lead.status)
   }).length
 }
 
-function selectAssignee({ assignedTo, requiredSkill, department } = {}) {
+async function selectAssignee({ assignedTo, requiredSkill, department } = {}) {
+  const users = await listUsers()
+
   if (assignedTo) {
-    const matching = demoUsers.find((user) => user.id === assignedTo)
+    const matching = users.find((user) => user.id === assignedTo)
     if (matching) {
       return matching
     }
   }
 
-  let pool = demoUsers.filter((user) => {
+  let pool = users.filter((user) => {
     return (user.role === 'sales' || user.role === 'manager') && user.status === 'active' && user.isAvailable !== false
   })
+  if (!pool.length) {
+    pool = users.filter((user) => user.role === 'admin' && user.status === 'active')
+  }
 
   if (department) {
     const departmentMatches = pool.filter((user) => user.department === department)
@@ -278,15 +361,20 @@ function selectAssignee({ assignedTo, requiredSkill, department } = {}) {
     }
   }
 
-  const underCapacity = pool.filter((user) => getActiveLeadLoad(user.id) < (user.maxActiveLeads || Number.MAX_SAFE_INTEGER))
+  const loadByUser = new Map()
+  for (const user of pool) {
+    loadByUser.set(user.id, await getActiveLeadLoad(user.id))
+  }
+
+  const underCapacity = pool.filter((user) => loadByUser.get(user.id) < (user.maxActiveLeads || Number.MAX_SAFE_INTEGER))
   if (underCapacity.length) {
     pool = underCapacity
   }
 
-  const sortedByLoad = [...pool].sort((a, b) => getActiveLeadLoad(a.id) - getActiveLeadLoad(b.id))
-  const lowestLoad = getActiveLeadLoad(sortedByLoad[0]?.id)
-  const tiedUsers = sortedByLoad.filter((user) => getActiveLeadLoad(user.id) === lowestLoad)
-  const selected = tiedUsers[roundRobinIndex % Math.max(1, tiedUsers.length)] || sortedByLoad[0] || demoUsers[0]
+  const sortedByLoad = [...pool].sort((a, b) => (loadByUser.get(a.id) || 0) - (loadByUser.get(b.id) || 0))
+  const lowestLoad = loadByUser.get(sortedByLoad[0]?.id)
+  const tiedUsers = sortedByLoad.filter((user) => (loadByUser.get(user.id) || 0) === lowestLoad)
+  const selected = tiedUsers[roundRobinIndex % Math.max(1, tiedUsers.length)] || sortedByLoad[0] || users[0]
 
   roundRobinIndex += 1
   return selected
@@ -295,6 +383,202 @@ function selectAssignee({ assignedTo, requiredSkill, department } = {}) {
 function appendTimeline(lead, entry) {
   lead.timeline = lead.timeline || []
   lead.timeline.unshift({ id: randomUUID(), timestamp: new Date().toISOString(), ...entry })
+}
+
+function plainify(record) {
+  if (!record) {
+    return null
+  }
+
+  return JSON.parse(JSON.stringify(record))
+}
+
+function mapNestedCollection(items = []) {
+  return items.map((item) => {
+    const entry = plainify(item)
+    if (!entry.id && entry._id) {
+      entry.id = String(entry._id)
+    }
+    delete entry._id
+    delete entry.__v
+    return entry
+  })
+}
+
+function serializeLead(record) {
+  const lead = plainify(record)
+  if (!lead) {
+    return null
+  }
+
+  lead.id = String(lead._id || lead.id)
+  lead.callLogs = mapNestedCollection(lead.callLogs)
+  lead.messages = mapNestedCollection(lead.messages)
+  lead.timeline = mapNestedCollection(lead.timeline)
+  if (lead.automation?.followUpSequence) {
+    lead.automation.followUpSequence = mapNestedCollection(lead.automation.followUpSequence)
+  }
+  delete lead._id
+  delete lead.__v
+  return lead
+}
+
+function serializeClient(record) {
+  const client = plainify(record)
+  if (!client) {
+    return null
+  }
+
+  client.id = String(client._id || client.id)
+  client.callLogs = mapNestedCollection(client.callLogs)
+  client.messages = mapNestedCollection(client.messages)
+  client.timeline = mapNestedCollection(client.timeline)
+  delete client._id
+  delete client.__v
+  return client
+}
+
+function serializeRecord(record) {
+  const item = plainify(record)
+  if (!item) {
+    return null
+  }
+
+  item.id = String(item._id || item.id)
+  delete item._id
+  delete item.__v
+  return item
+}
+
+function parseTags(value) {
+  if (Array.isArray(value)) {
+    return value.map((tag) => String(tag).trim()).filter(Boolean)
+  }
+
+  return String(value || '')
+    .split(',')
+    .map((tag) => tag.trim())
+    .filter(Boolean)
+}
+
+function computeLeadScore(payload) {
+  const sourceWeights = {
+    meta_ads: 28,
+    whatsapp: 24,
+    linkedin: 22,
+    website: 20,
+    referral: 26,
+    ivr: 21,
+    manual: 12,
+    email: 14,
+    api: 16,
+    event: 18,
+    other: 10,
+  }
+  const levelWeights = { low: 6, medium: 15, high: 28 }
+
+  let score = 20
+  score += sourceWeights[payload.source || 'other'] || 10
+  score += payload.budget ? Math.min(20, Math.round(payload.budget / 5000)) : 0
+  score += levelWeights[payload.interestLevel || 'medium']
+  score += levelWeights[payload.engagementLevel || 'medium']
+  score += payload.consent?.marketingOptIn ? 4 : 0
+  score += payload.email ? 3 : 0
+  score += payload.phone ? 3 : 0
+
+  return Math.max(1, Math.min(100, score))
+}
+
+function deriveSegment(score) {
+  if (score >= 85) return 'hot'
+  if (score >= 60) return 'warm'
+  return 'cold'
+}
+
+function derivePriority(payload, segment) {
+  if (payload.priority) {
+    return payload.priority
+  }
+  if (segment === 'hot') return 'high'
+  if (segment === 'warm') return 'medium'
+  return 'low'
+}
+
+function leadScoreVariant(score) {
+  return score >= 85 ? 'A' : score >= 60 ? 'B' : 'C'
+}
+
+function buildLeadTags(payload, segment, baseTags) {
+  const tags = new Set(baseTags)
+  tags.add(payload.source || 'manual')
+  tags.add(segment)
+  if (payload.interestLevel) tags.add(`interest:${payload.interestLevel}`)
+  if (payload.location?.city) tags.add(`city:${payload.location.city.toLowerCase()}`)
+  if (payload.location?.country) tags.add(`country:${payload.location.country.toLowerCase()}`)
+  return [...tags]
+}
+
+function buildFollowUpSequence(lead, preferredChannels = []) {
+  const channels = preferredChannels.length
+    ? preferredChannels
+    : lead.phone
+      ? ['whatsapp', 'email', 'sms']
+      : ['email']
+
+  const steps = [
+    { dayOffset: 0, channel: channels[0] || 'email', templateName: 'instant_response', message: `Hi ${lead.name}, thanks for reaching out. We have received your inquiry.` },
+    { dayOffset: 3, channel: channels[1] || channels[0] || 'email', templateName: 'day_3_followup', message: `Hi ${lead.name}, following up in case you want pricing, case studies, or a quick demo.` },
+    { dayOffset: 7, channel: channels[2] || channels[0] || 'email', templateName: 'day_7_followup', message: `Hi ${lead.name}, sharing one last follow-up. We can help you with a tailored solution when you're ready.` },
+  ]
+
+  return steps.map((step) => ({
+    id: randomUUID(),
+    ...step,
+    status: 'pending',
+    scheduledFor: new Date(Date.now() + step.dayOffset * 24 * 60 * 60 * 1000).toISOString(),
+  }))
+}
+
+async function maybeNotifyHotLead(lead) {
+  if (lead.segment !== 'hot') {
+    return null
+  }
+
+  return notifySlack({
+    text: `Hot lead captured: ${lead.name} (${lead.company}) from ${lead.source}. Assigned to ${lead.assignedUserName}.`,
+  })
+}
+
+async function runInitialOutreach(lead) {
+  const sequence = lead.automation?.followUpSequence || []
+  const step = sequence[0]
+  const results = []
+
+  if (!step) {
+    return results
+  }
+
+  if (step.channel === 'whatsapp' && lead.phone) {
+    const result = await sendWhatsAppTemplate({
+      to: lead.phone.replace(/\D/g, ''),
+      templateName: step.templateName || 'new_lead_welcome',
+      variables: [lead.name],
+    })
+    results.push({ channel: 'whatsapp', ...result, body: step.message })
+  } else if (step.channel === 'sms' && lead.phone) {
+    const result = await sendSmsMessage({ to: lead.phone, body: step.message })
+    results.push({ channel: 'sms', ...result, body: step.message })
+  } else if (lead.email) {
+    const result = await sendEmailMessage({
+      to: lead.email,
+      subject: 'Thanks for contacting us',
+      body: step.message,
+      leadId: lead.id,
+    })
+    results.push({ channel: 'email', ...result, body: step.message })
+  }
+
+  return results
 }
 
 async function writeActivity(action, entityType, entityId, metadata = {}, actor = null) {
@@ -320,25 +604,68 @@ async function writeActivity(action, entityType, entityId, metadata = {}, actor 
   }
 }
 
-function findLead(leadId) {
-  return store.leads.find((lead) => lead.id === leadId)
+async function findLead(leadId) {
+  if (isMongoReady()) {
+    const lead = await Lead.findById(leadId)
+    return serializeLead(lead)
+  }
+
+  return store.leads.find((lead) => lead.id === leadId) || null
 }
 
 function normalizePhone(value = '') {
   return String(value).replace(/\D/g, '')
 }
 
-function findLeadByPhone(phone) {
+async function findLeadByPhone(phone) {
   const normalized = normalizePhone(phone)
   if (!normalized) {
     return null
   }
 
+  if (isMongoReady()) {
+    const leads = await Lead.find({ phone: { $exists: true, $ne: null } }).sort({ createdAt: -1 }).lean()
+    const match = leads.find((lead) => normalizePhone(lead.phone) === normalized)
+    return serializeLead(match)
+  }
+
   return store.leads.find((lead) => normalizePhone(lead.phone) === normalized) || null
 }
 
-function findClient(clientId) {
-  return store.clients.find((client) => client.id === clientId)
+async function findLeadByIdentity({ phone, email }) {
+  if (isMongoReady()) {
+    const conditions = []
+    if (email) {
+      conditions.push({ email: String(email).toLowerCase() })
+    }
+    const normalizedPhone = normalizePhone(phone)
+    if (normalizedPhone) {
+      const mongoLeads = await Lead.find({ phone: { $exists: true, $ne: null } }).sort({ createdAt: -1 }).lean()
+      const phoneMatch = mongoLeads.find((lead) => normalizePhone(lead.phone) === normalizedPhone)
+      if (phoneMatch) {
+        return serializeLead(phoneMatch)
+      }
+    }
+    if (conditions.length) {
+      const record = await Lead.findOne({ $or: conditions })
+      return serializeLead(record)
+    }
+    return null
+  }
+
+  return store.leads.find((lead) =>
+    (email && lead.email?.toLowerCase() === String(email).toLowerCase()) ||
+    (phone && normalizePhone(lead.phone) === normalizePhone(phone))
+  ) || null
+}
+
+async function findClient(clientId) {
+  if (isMongoReady()) {
+    const client = await Client.findById(clientId)
+    return serializeClient(client)
+  }
+
+  return store.clients.find((client) => client.id === clientId) || null
 }
 
 function createClientFromLead(lead) {
@@ -359,9 +686,35 @@ function createClientFromLead(lead) {
   }
 }
 
-function ensureClientFromLead(lead) {
+async function ensureClientFromLead(lead) {
   if (!lead || !['converted', 'won'].includes(lead.status)) {
     return null
+  }
+
+  if (isMongoReady()) {
+    const existing = await Client.findOne({
+      $or: [
+        ...(lead.email ? [{ email: lead.email.toLowerCase() }] : []),
+        { company: lead.company },
+      ],
+    })
+
+    if (existing) {
+      return serializeClient(existing)
+    }
+
+    const client = await Client.create({
+      ...createClientFromLead(lead),
+      accountOwnerId: lead.assignedTo,
+      accountOwnerName: lead.assignedUserName,
+      healthScore: lead.score,
+      renewalDate: lead.nextFollowUp,
+      lastContactChannel: lead.lastContactChannel,
+      callLogs: lead.callLogs || [],
+      messages: lead.messages || [],
+      timeline: lead.timeline || [],
+    })
+    return serializeClient(client)
   }
 
   const existing = store.clients.find((client) => {
@@ -387,14 +740,74 @@ function ensureClientFromLead(lead) {
 }
 
 async function createLead(payload, actor = null) {
-  const assignee = selectAssignee(payload)
+  const existingLead = await findLeadByIdentity({ phone: payload.phone, email: payload.email })
+  const assignee = await selectAssignee(payload)
+  if (!assignee) {
+    const error = new Error('No active CRM users are available for lead assignment. Configure ADMIN_EMAIL and ADMIN_PASSWORD, then restart the API.')
+    error.statusCode = 503
+    throw error
+  }
   const now = new Date().toISOString()
-  const parsedTags = Array.isArray(payload.tags)
-    ? payload.tags
-    : String(payload.tags || '')
-        .split(',')
-        .map((tag) => tag.trim())
-        .filter(Boolean)
+  const parsedTags = parseTags(payload.tags)
+  const score = computeLeadScore(payload)
+  const segment = deriveSegment(score)
+  const priority = derivePriority(payload, segment)
+  const followUpSequence = buildFollowUpSequence(
+    { name: payload.name, phone: payload.phone, email: payload.email },
+    payload.preferredChannels
+  )
+  const tags = buildLeadTags(payload, segment, parsedTags)
+
+  if (existingLead) {
+    const mergedLead = {
+      ...existingLead,
+      name: payload.name || existingLead.name,
+      phone: payload.phone || existingLead.phone,
+      email: payload.email || existingLead.email,
+      company: payload.company || existingLead.company,
+      notes: [existingLead.notes, payload.notes].filter(Boolean).join('\n'),
+      source: payload.source || existingLead.source,
+      status: existingLead.status === 'converted' ? existingLead.status : payload.status || existingLead.status,
+      department: payload.department || existingLead.department,
+      requiredSkill: payload.requiredSkill || existingLead.requiredSkill,
+      score: Math.max(existingLead.score || 0, score),
+      segment,
+      budget: payload.budget ?? existingLead.budget,
+      interestLevel: payload.interestLevel || existingLead.interestLevel,
+      engagementLevel: payload.engagementLevel || existingLead.engagementLevel,
+      location: payload.location || existingLead.location,
+      consent: payload.consent ? { ...(existingLead.consent || {}), ...payload.consent } : existingLead.consent,
+      sourceMeta: payload.sourceMeta ? { ...(existingLead.sourceMeta || {}), ...payload.sourceMeta } : existingLead.sourceMeta,
+      priority,
+      tags: Array.from(new Set([...(existingLead.tags || []), ...tags])),
+      lastActivity: now,
+      nextFollowUp: payload.nextFollowUp || existingLead.nextFollowUp || followUpSequence[0]?.scheduledFor,
+      automation: {
+        ...(existingLead.automation || {}),
+        autoAssigned: true,
+        chatbotEnabled: true,
+        lastWorkflow: 'lead-dedup-merge',
+        followUpSequence: existingLead.automation?.followUpSequence || followUpSequence,
+      },
+    }
+
+    appendTimeline(mergedLead, {
+      type: 'system',
+      title: 'Duplicate capture merged',
+      description: `A new ${payload.source} capture matched this lead, so the record was merged instead of duplicated.`,
+    })
+
+    if (isMongoReady()) {
+      const saved = await Lead.findByIdAndUpdate(existingLead.id, mergedLead, { new: true })
+      const serialized = serializeLead(saved)
+      await writeActivity('lead.merged', 'lead', serialized.id, { source: payload.source }, actor)
+      return serialized
+    }
+
+    Object.assign(existingLead, mergedLead)
+    await writeActivity('lead.merged', 'lead', existingLead.id, { source: payload.source }, actor)
+    return existingLead
+  }
 
   const lead = {
     id: randomUUID(),
@@ -408,11 +821,24 @@ async function createLead(payload, actor = null) {
     assignedUserName: assignee.name,
     department: payload.department || assignee.department,
     requiredSkill: payload.requiredSkill,
-    score: payload.priority === 'high' ? 88 : payload.source === 'meta_ads' ? 90 : 72,
-    value: payload.source === 'meta_ads' ? 50000 : 25000,
+    score,
+    segment,
+    value: payload.budget || (payload.source === 'meta_ads' ? 50000 : 25000),
+    budget: payload.budget,
+    interestLevel: payload.interestLevel || 'medium',
+    engagementLevel: payload.engagementLevel || 'medium',
     notes: payload.notes || 'Lead captured via CRM API.',
-    priority: payload.priority || 'medium',
-    tags: parsedTags,
+    priority,
+    tags,
+    location: payload.location,
+    consent: {
+      termsAccepted: Boolean(payload.consent?.termsAccepted),
+      marketingOptIn: Boolean(payload.consent?.marketingOptIn),
+      privacyAcceptedAt: payload.consent?.privacyAcceptedAt || now,
+      captureMethod: payload.consent?.captureMethod || payload.source || 'manual',
+      ipAddress: actor?.ipAddress,
+    },
+    sourceMeta: payload.sourceMeta || {},
     lastActivity: now,
     createdAt: now,
     lastContacted: now,
@@ -424,6 +850,9 @@ async function createLead(payload, actor = null) {
       autoAssigned: true,
       lastWorkflow: 'new-lead-welcome',
       chatbotEnabled: true,
+      abVariant: leadScoreVariant(score),
+      followUpSequence,
+      lastSyncedAt: now,
     },
   }
 
@@ -433,56 +862,235 @@ async function createLead(payload, actor = null) {
     description: `Lead was added from ${lead.source} and assigned to ${assignee.name}.`,
   })
 
-  store.leads.unshift(lead)
-  await writeActivity('lead.created', 'lead', lead.id, { source: lead.source }, actor)
-
-  if (lead.phone) {
-    const whatsappResult = await sendWhatsAppTemplate({
-      to: lead.phone.replace(/\D/g, ''),
-      templateName: 'new_lead_welcome',
-      variables: [lead.name],
-    })
-
+  const outreachResults = await runInitialOutreach(lead)
+  for (const result of outreachResults) {
     lead.messages.unshift({
       id: randomUUID(),
-      channel: 'whatsapp',
+      channel: result.channel,
       direction: 'outbound',
-      body: whatsappResult.sent
-        ? `Welcome template sent to ${lead.name}.`
-        : 'WhatsApp template queued. Complete Cloud API credentials to deliver messages.',
-      templateName: 'new_lead_welcome',
-      status: whatsappResult.sent ? 'delivered' : 'failed',
+      body: result.body,
+      templateName: followUpSequence[0]?.templateName,
+      status: result.sent ? 'delivered' : 'failed',
       timestamp: new Date().toISOString(),
     })
   }
 
-  ensureClientFromLead(lead)
-  return lead
+  await maybeNotifyHotLead(lead)
+  await syncLeadToAutomationPlatforms({
+    event: 'lead.created',
+    lead,
+    team: { assignedTo: lead.assignedTo, assignedUserName: lead.assignedUserName },
+  })
+
+  let persistedLead = lead
+  if (isMongoReady()) {
+    const saved = await Lead.create({
+      ...lead,
+      automation: {
+        ...lead.automation,
+        followUpSequence: followUpSequence.map(({ id, ...step }) => step),
+      },
+      messages: lead.messages,
+      timeline: lead.timeline,
+    })
+    persistedLead = serializeLead(saved)
+  } else {
+    store.leads.unshift(lead)
+  }
+
+  await writeActivity('lead.created', 'lead', persistedLead.id, { source: persistedLead.source, segment }, actor)
+  await ensureClientFromLead(persistedLead)
+  return persistedLead
+}
+
+async function listLeads(filters = {}) {
+  if (isMongoReady()) {
+    const query = {}
+    if (filters.status) query.status = filters.status
+    if (filters.source) query.source = filters.source
+    if (filters.assignedTo) query.assignedTo = filters.assignedTo
+
+    let records = (await Lead.find(query).sort({ createdAt: -1 })).map(serializeLead)
+    const search = String(filters.q || '').toLowerCase()
+    if (search) {
+      records = records.filter((lead) =>
+        [lead.name, lead.email, lead.phone, lead.company].filter(Boolean).some((value) => value.toLowerCase().includes(search))
+      )
+    }
+    return records
+  }
+
+  const { status, source, assignedTo, q } = filters
+  return store.leads.filter((lead) => {
+    const matchesStatus = !status || lead.status === status
+    const matchesSource = !source || lead.source === source
+    const matchesAssigned = !assignedTo || lead.assignedTo === assignedTo
+    const search = String(q || '').toLowerCase()
+    const matchesQuery =
+      !search ||
+      lead.name.toLowerCase().includes(search) ||
+      lead.email.toLowerCase().includes(search) ||
+      lead.phone.toLowerCase().includes(search) ||
+      lead.company.toLowerCase().includes(search)
+
+    return matchesStatus && matchesSource && matchesAssigned && matchesQuery
+  })
+}
+
+async function listClients() {
+  if (isMongoReady()) {
+    return (await Client.find().sort({ createdAt: -1 })).map(serializeClient)
+  }
+
+  return store.clients
+}
+
+async function listDeals() {
+  if (isMongoReady()) {
+    return (await Deal.find().sort({ updatedAt: -1, createdAt: -1 })).map(serializeRecord)
+  }
+
+  return store.deals
+}
+
+async function listTasks() {
+  if (isMongoReady()) {
+    return (await Task.find().sort({ dueDate: 1, createdAt: -1 })).map(serializeRecord)
+  }
+
+  return store.tasks
+}
+
+function buildAnalyticsFromLeads(leads) {
+  const totalLeads = leads.length
+  const converted = leads.filter((lead) => ['converted', 'won'].includes(lead.status)).length
+  const hotLeads = leads.filter((lead) => lead.segment === 'hot').length
+  const warmLeads = leads.filter((lead) => lead.segment === 'warm').length
+  const coldLeads = leads.filter((lead) => lead.segment === 'cold').length
+  const totalValue = leads.reduce((sum, lead) => sum + (lead.value || 0), 0)
+  const avgScore = totalLeads ? Math.round(leads.reduce((sum, lead) => sum + (lead.score || 0), 0) / totalLeads) : 0
+  const conversionRate = totalLeads ? Number(((converted / totalLeads) * 100).toFixed(1)) : 0
+
+  const sourcePerformance = Object.entries(
+    leads.reduce((acc, lead) => {
+      acc[lead.source] = acc[lead.source] || { leads: 0, conversions: 0, value: 0 }
+      acc[lead.source].leads += 1
+      acc[lead.source].value += lead.value || 0
+      if (['converted', 'won'].includes(lead.status)) {
+        acc[lead.source].conversions += 1
+      }
+      return acc
+    }, {})
+  ).map(([source, stats]) => ({
+    source,
+    leads: stats.leads,
+    conversions: stats.conversions,
+    conversionRate: stats.leads ? Number(((stats.conversions / stats.leads) * 100).toFixed(1)) : 0,
+    pipelineValue: stats.value,
+  }))
+
+  return {
+    summary: { totalLeads, converted, conversionRate, hotLeads, warmLeads, coldLeads, totalValue, avgScore },
+    sourcePerformance,
+    funnel: [
+      { stage: 'Captured', count: totalLeads },
+      { stage: 'Qualified', count: leads.filter((lead) => ['interested', 'converted', 'won'].includes(lead.status) || lead.segment === 'hot').length },
+      { stage: 'Converted', count: converted },
+    ],
+  }
+}
+
+function getAutomationBlueprint() {
+  return {
+    workflowDiagram: [
+      '1. Lead Source -> Landing Page / Form / Ad / LinkedIn / WhatsApp / IVR',
+      '2. Capture API -> Validate consent, normalize fields, deduplicate by phone/email',
+      '3. Qualification Engine -> Score by source, budget, intent, engagement, and enrichment',
+      '4. Routing Engine -> Tag, segment hot/warm/cold, assign owner by skill + load',
+      '5. Response Engine -> Instant WhatsApp / Email / SMS reply + Day 1 / Day 3 / Day 7 sequence',
+      '6. Notifications -> Slack / Email alert for hot leads + task creation for sales',
+      '7. CRM Sync -> Mongo-backed CRM record + outbound Zapier/Make sync',
+      '8. Analytics -> Source conversion, ROI, response performance, and funnel dashboard',
+    ],
+    toolStack: {
+      free: [
+        { category: 'Forms', tools: ['Google Forms', 'Typeform Free', 'Custom Vite landing page'] },
+        { category: 'CRM/Data', tools: ['MongoDB Atlas Free', 'Airtable Free'] },
+        { category: 'Automation', tools: ['Make free tier', 'Zapier starter trial'] },
+        { category: 'Reporting', tools: ['Google Sheets', 'Looker Studio'] },
+      ],
+      paid: [
+        { category: 'CRM', tools: ['HubSpot Starter', 'Zoho CRM Professional'] },
+        { category: 'Messaging', tools: ['Twilio SMS/WhatsApp', 'Meta WhatsApp Cloud API'] },
+        { category: 'Sales Alerts', tools: ['Slack', 'Google Workspace email'] },
+        { category: 'Optimization', tools: ['Vercel Pro', 'MongoDB Atlas dedicated tier'] },
+      ],
+    },
+    sampleWorkflows: [
+      'Meta/Instagram lead -> score > 85 -> assign inbound rep -> send WhatsApp welcome -> Slack hot-lead alert -> schedule Day 3 and Day 7 follow-up.',
+      'Website pricing form -> budget > 25000 -> tag enterprise -> send email case study -> create sales task -> sync to HubSpot/Zoho via webhook.',
+      'WhatsApp inbound -> unknown number -> auto-create lead -> reply instantly -> mark warm -> notify shared team inbox.',
+    ],
+    messageExamples: {
+      email: 'Subject: Thanks for reaching out\nHi {{name}}, thanks for your interest in {{company}}. We can help you streamline lead management and follow-ups. Would you like a 15-minute walkthrough this week?',
+      sms: 'Hi {{name}}, thanks for contacting us. Reply with the best time for a quick call and we will coordinate right away.',
+      whatsapp: 'Hi {{name}}, thanks for your inquiry. We received your request and one of our specialists will contact you shortly. If you want pricing or a demo, just reply here.',
+    },
+    bestPractices: [
+      'Keep every form under 5 required fields unless the campaign is high-intent.',
+      'Route hot leads in under 5 minutes and include a human follow-up task even when automation fires.',
+      'Use consent checkboxes and store the timestamp, source, and policy acceptance method.',
+      'Run A/B tests on form length, CTA text, and first-touch message copy.',
+      'Track source-level CPL, conversion rate, and speed-to-lead weekly.',
+    ],
+  }
 }
 
 app.get('/api/health', (_req, res) => {
   res.json({
     status: 'ok',
     time: new Date().toISOString(),
-    mongo: mongoose.connection.readyState === 1 ? 'connected' : 'demo-fallback',
+    mongo: mongoose.connection.readyState === 1 ? 'connected' : 'not-configured',
     integrations: getIntegrationStatus(),
   })
+})
+
+app.get('/api/automation/blueprint', authenticate, (_req, res) => {
+  res.json({ data: getAutomationBlueprint() })
+})
+
+app.get('/api/analytics/overview', authenticate, async (_req, res, next) => {
+  try {
+    const leads = await listLeads()
+    res.json({ data: buildAnalyticsFromLeads(leads) })
+  } catch (error) {
+    next(error)
+  }
 })
 
 app.post('/api/auth/login', async (req, res, next) => {
   try {
     const { email, password } = authSchema.parse(req.body)
-    const user = demoUsers.find((item) => item.email.toLowerCase() === email.toLowerCase())
+    let user = null
+    await connectMongo()
+
+    if (isMongoReady()) {
+      await ensureBootstrapAdmin()
+      user = await User.findOne({ email: email.toLowerCase(), status: 'active' }).lean()
+    } else {
+      user = store.users.find((item) => item.email.toLowerCase() === email.toLowerCase())
+    }
 
     if (!user || !(await bcrypt.compare(password, user.passwordHash))) {
       return res.status(401).json({ message: 'Invalid credentials' })
     }
 
-    const tokens = issueTokens(user)
-    await writeActivity('auth.login', 'auth', user.id, {}, user)
+    const safeUser = serializeUser(user)
+    const tokens = issueTokens(safeUser)
+    await writeActivity('auth.login', 'auth', safeUser.id, {}, safeUser)
 
     return res.json({
-      user: sanitizeUser(user),
+      user: safeUser,
       ...tokens,
     })
   } catch (error) {
@@ -530,12 +1138,51 @@ app.get('/api/integrations/status', authenticate, (_req, res) => {
   res.json({ data: getIntegrationStatus() })
 })
 
-app.get('/api/clients', authenticate, (_req, res) => {
-  res.json({ data: store.clients, total: store.clients.length })
+app.get('/api/users', authenticate, async (_req, res, next) => {
+  try {
+    const users = await listUsers()
+    res.json({ data: users, total: users.length })
+  } catch (error) {
+    next(error)
+  }
 })
 
-app.get('/api/clients/:id', authenticate, (req, res) => {
-  const client = findClient(req.params.id)
+app.get('/api/clients', authenticate, async (_req, res, next) => {
+  try {
+    const clients = await listClients()
+    res.json({ data: clients, total: clients.length })
+  } catch (error) {
+    next(error)
+  }
+})
+
+app.post('/api/clients', authenticate, requireRoles('admin', 'manager', 'sales'), async (req, res, next) => {
+  try {
+    const payload = clientPayloadSchema.parse(req.body)
+    const clientPayload = {
+      ...payload,
+      lastContact: payload.lastContact || new Date().toISOString(),
+      createdAt: new Date().toISOString(),
+    }
+
+    if (isMongoReady()) {
+      const client = await Client.create(clientPayload)
+      const serialized = serializeClient(client)
+      await writeActivity('client.created', 'client', serialized.id, {}, req.user)
+      return res.status(201).json({ data: serialized })
+    }
+
+    const client = { id: req.body.id || randomUUID(), ...clientPayload }
+    store.clients.unshift(client)
+    await writeActivity('client.created', 'client', client.id, {}, req.user)
+    return res.status(201).json({ data: client })
+  } catch (error) {
+    return next(error)
+  }
+})
+
+app.get('/api/clients/:id', authenticate, async (req, res) => {
+  const client = await findClient(req.params.id)
 
   if (!client) {
     return res.status(404).json({ message: 'Client not found' })
@@ -546,22 +1193,34 @@ app.get('/api/clients/:id', authenticate, (req, res) => {
 
 app.patch('/api/clients/:id', authenticate, requireRoles('admin', 'manager', 'sales'), async (req, res, next) => {
   try {
-    const client = findClient(req.params.id)
+    const client = await findClient(req.params.id)
     if (!client) {
       return res.status(404).json({ message: 'Client not found' })
     }
 
-    const updates = clientUpdateSchema.parse(req.body)
-    Object.assign(client, updates, { lastContact: updates.lastContact || new Date().toISOString() })
+    const updates = clientPayloadSchema.partial().parse(req.body)
+    const nextClient = {
+      ...client,
+      ...updates,
+      lastContact: updates.lastContact || new Date().toISOString(),
+    }
 
-    client.timeline = client.timeline || []
-    client.timeline.unshift({
+    nextClient.timeline = nextClient.timeline || []
+    nextClient.timeline.unshift({
       id: randomUUID(),
       type: 'status',
       title: 'Client updated',
       description: 'Client profile was updated from the CRM.',
       timestamp: new Date().toISOString(),
     })
+
+    if (isMongoReady()) {
+      const saved = await Client.findByIdAndUpdate(req.params.id, nextClient, { new: true })
+      await writeActivity('client.updated', 'client', req.params.id, updates, req.user)
+      return res.json({ data: serializeClient(saved) })
+    }
+
+    Object.assign(client, nextClient)
 
     await writeActivity('client.updated', 'client', client.id, updates, req.user)
     return res.json({ data: client })
@@ -572,7 +1231,7 @@ app.patch('/api/clients/:id', authenticate, requireRoles('admin', 'manager', 'sa
 
 app.post('/api/clients/:id/calls', authenticate, requireRoles('admin', 'manager', 'sales'), async (req, res, next) => {
   try {
-    const client = findClient(req.params.id)
+    const client = await findClient(req.params.id)
     if (!client) {
       return res.status(404).json({ message: 'Client not found' })
     }
@@ -597,6 +1256,10 @@ app.post('/api/clients/:id/calls', authenticate, requireRoles('admin', 'manager'
     client.lastContact = call.timestamp
     client.lastContactChannel = 'call'
 
+    if (isMongoReady()) {
+      await Client.findByIdAndUpdate(req.params.id, client, { new: true })
+    }
+
     await writeActivity('client.call.logged', 'client', client.id, payload, req.user)
     return res.status(201).json({ data: call })
   } catch (error) {
@@ -606,7 +1269,7 @@ app.post('/api/clients/:id/calls', authenticate, requireRoles('admin', 'manager'
 
 app.post('/api/clients/:id/messages', authenticate, requireRoles('admin', 'manager', 'sales'), async (req, res, next) => {
   try {
-    const client = findClient(req.params.id)
+    const client = await findClient(req.params.id)
     if (!client) {
       return res.status(404).json({ message: 'Client not found' })
     }
@@ -631,6 +1294,10 @@ app.post('/api/clients/:id/messages', authenticate, requireRoles('admin', 'manag
     client.lastContact = message.timestamp
     client.lastContactChannel = payload.channel === 'whatsapp' ? 'whatsapp' : 'email'
 
+    if (isMongoReady()) {
+      await Client.findByIdAndUpdate(req.params.id, client, { new: true })
+    }
+
     await writeActivity('client.message.logged', 'client', client.id, payload, req.user)
     return res.status(201).json({ data: message })
   } catch (error) {
@@ -638,25 +1305,165 @@ app.post('/api/clients/:id/messages', authenticate, requireRoles('admin', 'manag
   }
 })
 
-app.get('/api/leads', authenticate, (req, res) => {
-  const { status, source, assignedTo, q } = req.query
+app.get('/api/deals', authenticate, async (_req, res, next) => {
+  try {
+    const deals = await listDeals()
+    res.json({ data: deals, total: deals.length })
+  } catch (error) {
+    next(error)
+  }
+})
 
-  const data = store.leads.filter((lead) => {
-    const matchesStatus = !status || lead.status === status
-    const matchesSource = !source || lead.source === source
-    const matchesAssigned = !assignedTo || lead.assignedTo === assignedTo
-    const search = String(q || '').toLowerCase()
-    const matchesQuery =
-      !search ||
-      lead.name.toLowerCase().includes(search) ||
-      lead.email.toLowerCase().includes(search) ||
-      lead.phone.toLowerCase().includes(search) ||
-      lead.company.toLowerCase().includes(search)
+app.post('/api/deals', authenticate, requireRoles('admin', 'manager', 'sales'), async (req, res, next) => {
+  try {
+    const payload = dealPayloadSchema.parse(req.body)
+    if (isMongoReady()) {
+      const deal = await Deal.create(payload)
+      const serialized = serializeRecord(deal)
+      await writeActivity('deal.created', 'deal', serialized.id, {}, req.user)
+      return res.status(201).json({ data: serialized })
+    }
 
-    return matchesStatus && matchesSource && matchesAssigned && matchesQuery
-  })
+    const deal = { id: req.body.id || randomUUID(), createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(), ...payload }
+    store.deals.unshift(deal)
+    await writeActivity('deal.created', 'deal', deal.id, {}, req.user)
+    return res.status(201).json({ data: deal })
+  } catch (error) {
+    return next(error)
+  }
+})
 
-  res.json({ data, total: data.length })
+app.patch('/api/deals/:id', authenticate, requireRoles('admin', 'manager', 'sales'), async (req, res, next) => {
+  try {
+    const updates = dealPayloadSchema.partial().parse(req.body)
+    if (isMongoReady()) {
+      const saved = await Deal.findByIdAndUpdate(req.params.id, { ...updates, updatedAt: new Date() }, { new: true })
+      if (!saved) return res.status(404).json({ message: 'Deal not found' })
+      const serialized = serializeRecord(saved)
+      await writeActivity('deal.updated', 'deal', serialized.id, updates, req.user)
+      return res.json({ data: serialized })
+    }
+
+    const deal = store.deals.find((item) => item.id === req.params.id)
+    if (!deal) return res.status(404).json({ message: 'Deal not found' })
+    Object.assign(deal, updates, { updatedAt: new Date().toISOString() })
+    await writeActivity('deal.updated', 'deal', deal.id, updates, req.user)
+    return res.json({ data: deal })
+  } catch (error) {
+    return next(error)
+  }
+})
+
+app.delete('/api/deals/:id', authenticate, requireRoles('admin', 'manager'), async (req, res, next) => {
+  try {
+    if (isMongoReady()) {
+      const deleted = await Deal.findByIdAndDelete(req.params.id)
+      if (!deleted) return res.status(404).json({ message: 'Deal not found' })
+    } else {
+      const index = store.deals.findIndex((deal) => deal.id === req.params.id)
+      if (index === -1) return res.status(404).json({ message: 'Deal not found' })
+      store.deals.splice(index, 1)
+    }
+
+    await writeActivity('deal.deleted', 'deal', req.params.id, {}, req.user)
+    return res.json({ success: true })
+  } catch (error) {
+    return next(error)
+  }
+})
+
+app.get('/api/tasks', authenticate, async (_req, res, next) => {
+  try {
+    const tasks = await listTasks()
+    res.json({ data: tasks, total: tasks.length })
+  } catch (error) {
+    next(error)
+  }
+})
+
+app.post('/api/tasks', authenticate, requireRoles('admin', 'manager', 'sales'), async (req, res, next) => {
+  try {
+    const payload = taskPayloadSchema.parse(req.body)
+    if (isMongoReady()) {
+      const task = await Task.create(payload)
+      const serialized = serializeRecord(task)
+      await writeActivity('task.created', 'task', serialized.id, {}, req.user)
+      return res.status(201).json({ data: serialized })
+    }
+
+    const task = { id: req.body.id || randomUUID(), createdAt: new Date().toISOString(), ...payload }
+    store.tasks.unshift(task)
+    await writeActivity('task.created', 'task', task.id, {}, req.user)
+    return res.status(201).json({ data: task })
+  } catch (error) {
+    return next(error)
+  }
+})
+
+app.patch('/api/tasks/:id', authenticate, requireRoles('admin', 'manager', 'sales'), async (req, res, next) => {
+  try {
+    const updates = taskPayloadSchema.partial().parse(req.body)
+    if (isMongoReady()) {
+      const saved = await Task.findByIdAndUpdate(req.params.id, updates, { new: true })
+      if (!saved) return res.status(404).json({ message: 'Task not found' })
+      const serialized = serializeRecord(saved)
+      await writeActivity('task.updated', 'task', serialized.id, updates, req.user)
+      return res.json({ data: serialized })
+    }
+
+    const task = store.tasks.find((item) => item.id === req.params.id)
+    if (!task) return res.status(404).json({ message: 'Task not found' })
+    Object.assign(task, updates)
+    await writeActivity('task.updated', 'task', task.id, updates, req.user)
+    return res.json({ data: task })
+  } catch (error) {
+    return next(error)
+  }
+})
+
+app.delete('/api/tasks/:id', authenticate, requireRoles('admin', 'manager'), async (req, res, next) => {
+  try {
+    if (isMongoReady()) {
+      const deleted = await Task.findByIdAndDelete(req.params.id)
+      if (!deleted) return res.status(404).json({ message: 'Task not found' })
+    } else {
+      const index = store.tasks.findIndex((task) => task.id === req.params.id)
+      if (index === -1) return res.status(404).json({ message: 'Task not found' })
+      store.tasks.splice(index, 1)
+    }
+
+    await writeActivity('task.deleted', 'task', req.params.id, {}, req.user)
+    return res.json({ success: true })
+  } catch (error) {
+    return next(error)
+  }
+})
+
+app.get('/api/leads', authenticate, async (req, res, next) => {
+  try {
+    const data = await listLeads(req.query)
+    res.json({ data, total: data.length })
+  } catch (error) {
+    next(error)
+  }
+})
+
+app.delete('/api/clients/:id', authenticate, requireRoles('admin', 'manager'), async (req, res, next) => {
+  try {
+    if (isMongoReady()) {
+      const deleted = await Client.findByIdAndDelete(req.params.id)
+      if (!deleted) return res.status(404).json({ message: 'Client not found' })
+    } else {
+      const index = store.clients.findIndex((client) => client.id === req.params.id)
+      if (index === -1) return res.status(404).json({ message: 'Client not found' })
+      store.clients.splice(index, 1)
+    }
+
+    await writeActivity('client.deleted', 'client', req.params.id, {}, req.user)
+    return res.json({ success: true })
+  } catch (error) {
+    return next(error)
+  }
 })
 
 app.post('/api/leads', authenticate, requireRoles('admin', 'manager', 'sales'), async (req, res, next) => {
@@ -669,8 +1476,8 @@ app.post('/api/leads', authenticate, requireRoles('admin', 'manager', 'sales'), 
   }
 })
 
-app.get('/api/leads/:id', authenticate, (req, res) => {
-  const lead = findLead(req.params.id)
+app.get('/api/leads/:id', authenticate, async (req, res) => {
+  const lead = await findLead(req.params.id)
 
   if (!lead) {
     return res.status(404).json({ message: 'Lead not found' })
@@ -681,7 +1488,7 @@ app.get('/api/leads/:id', authenticate, (req, res) => {
 
 app.patch('/api/leads/:id', authenticate, requireRoles('admin', 'manager', 'sales'), async (req, res, next) => {
   try {
-    const lead = findLead(req.params.id)
+    const lead = await findLead(req.params.id)
     if (!lead) {
       return res.status(404).json({ message: 'Lead not found' })
     }
@@ -695,7 +1502,20 @@ app.patch('/api/leads/:id', authenticate, requireRoles('admin', 'manager', 'sale
       description: 'Lead profile or stage was updated from the CRM.',
     })
 
-    const client = ensureClientFromLead(lead)
+    if (updates.score || updates.priority) {
+      lead.segment = deriveSegment(Number(updates.score || lead.score || 0))
+      lead.priority = derivePriority(lead, lead.segment)
+    }
+
+    if (isMongoReady()) {
+      const saved = await Lead.findByIdAndUpdate(req.params.id, lead, { new: true })
+      const serialized = serializeLead(saved)
+      const client = await ensureClientFromLead(serialized)
+      await writeActivity('lead.updated', 'lead', serialized.id, updates, req.user)
+      return res.json({ data: serialized, client })
+    }
+
+    const client = await ensureClientFromLead(lead)
 
     await writeActivity('lead.updated', 'lead', lead.id, updates, req.user)
     return res.json({ data: lead, client })
@@ -704,8 +1524,8 @@ app.patch('/api/leads/:id', authenticate, requireRoles('admin', 'manager', 'sale
   }
 })
 
-app.get('/api/leads/:id/timeline', authenticate, (req, res) => {
-  const lead = findLead(req.params.id)
+app.get('/api/leads/:id/timeline', authenticate, async (req, res) => {
+  const lead = await findLead(req.params.id)
 
   if (!lead) {
     return res.status(404).json({ message: 'Lead not found' })
@@ -716,7 +1536,7 @@ app.get('/api/leads/:id/timeline', authenticate, (req, res) => {
 
 app.post('/api/leads/:id/calls', authenticate, requireRoles('admin', 'manager', 'sales'), async (req, res, next) => {
   try {
-    const lead = findLead(req.params.id)
+    const lead = await findLead(req.params.id)
     if (!lead) {
       return res.status(404).json({ message: 'Lead not found' })
     }
@@ -757,6 +1577,10 @@ app.post('/api/leads/:id/calls', authenticate, requireRoles('admin', 'manager', 
       })
     }
 
+    if (isMongoReady()) {
+      await Lead.findByIdAndUpdate(req.params.id, lead, { new: true })
+    }
+
     await writeActivity('call.logged', 'call', call.id, { leadId: lead.id, provider: payload.provider }, req.user)
 
     return res.status(201).json({ data: call, integration: callProviderResult })
@@ -767,7 +1591,7 @@ app.post('/api/leads/:id/calls', authenticate, requireRoles('admin', 'manager', 
 
 app.post('/api/leads/:id/messages', authenticate, requireRoles('admin', 'manager', 'sales'), async (req, res, next) => {
   try {
-    const lead = findLead(req.params.id)
+    const lead = await findLead(req.params.id)
     if (!lead) {
       return res.status(404).json({ message: 'Lead not found' })
     }
@@ -791,6 +1615,10 @@ app.post('/api/leads/:id/messages', authenticate, requireRoles('admin', 'manager
       description: payload.body,
     })
 
+    if (isMongoReady()) {
+      await Lead.findByIdAndUpdate(req.params.id, lead, { new: true })
+    }
+
     await writeActivity('message.logged', 'message', message.id, { leadId: lead.id, channel: payload.channel }, req.user)
 
     return res.status(201).json({ data: message })
@@ -799,12 +1627,58 @@ app.post('/api/leads/:id/messages', authenticate, requireRoles('admin', 'manager
   }
 })
 
-app.get('/api/calls', authenticate, (_req, res) => {
-  res.json({ data: store.calls, total: store.calls.length })
+app.get('/api/calls', authenticate, async (_req, res, next) => {
+  try {
+    if (isMongoReady()) {
+      const leads = await listLeads()
+      const calls = leads.flatMap((lead) => (lead.callLogs || []).map((call) => ({ leadId: lead.id, leadName: lead.name, ...call })))
+      return res.json({ data: calls, total: calls.length })
+    }
+
+    res.json({ data: store.calls, total: store.calls.length })
+  } catch (error) {
+    next(error)
+  }
 })
 
-app.get('/api/messages', authenticate, (_req, res) => {
-  res.json({ data: store.messages, total: store.messages.length })
+app.get('/api/messages', authenticate, async (_req, res, next) => {
+  try {
+    if (isMongoReady()) {
+      const leads = await listLeads()
+      const messages = leads.flatMap((lead) => (lead.messages || []).map((message) => ({ leadId: lead.id, leadName: lead.name, ...message })))
+      return res.json({ data: messages, total: messages.length })
+    }
+
+    res.json({ data: store.messages, total: store.messages.length })
+  } catch (error) {
+    next(error)
+  }
+})
+
+app.post('/api/capture/forms', async (req, res, next) => {
+  try {
+    const payload = leadSchema.parse({
+      ...req.body,
+      source: req.body.source || 'website',
+      consent: {
+        termsAccepted: req.body.termsAccepted,
+        marketingOptIn: req.body.marketingOptIn,
+        privacyAcceptedAt: new Date().toISOString(),
+        captureMethod: req.body.captureMethod || 'landing_page',
+      },
+      sourceMeta: {
+        formId: req.body.formId,
+        campaignId: req.body.campaignId,
+        utmSource: req.body.utmSource,
+        utmCampaign: req.body.utmCampaign,
+      },
+    })
+
+    const lead = await createLead(payload, { name: 'Public Capture', id: 'public-form', ipAddress: req.ip })
+    res.status(201).json({ data: lead })
+  } catch (error) {
+    next(error)
+  }
 })
 
 app.get('/api/webhooks/meta-ads', (req, res) => {
@@ -836,6 +1710,9 @@ app.post('/api/webhooks/meta-ads', async (req, res, next) => {
         requiredSkill: 'meta_ads',
         priority: 'high',
         tags: ['meta_ads', 'auto-captured'],
+        interestLevel: 'high',
+        engagementLevel: 'high',
+        sourceMeta: { rawWebhook: req.body },
       },
       null
     )
@@ -848,7 +1725,7 @@ app.post('/api/webhooks/meta-ads', async (req, res, next) => {
 
 app.post('/api/webhooks/ivr', async (req, res, next) => {
   try {
-    let lead = findLead(req.body.leadId) || findLeadByPhone(req.body.from || req.body.phone)
+    let lead = (req.body.leadId ? await findLead(req.body.leadId) : null) || await findLeadByPhone(req.body.from || req.body.phone)
 
     if (!lead) {
       lead = await createLead(
@@ -863,6 +1740,8 @@ app.post('/api/webhooks/ivr', async (req, res, next) => {
           requiredSkill: 'ivr',
           priority: 'high',
           tags: ['ivr', 'auto-created'],
+          interestLevel: 'high',
+          engagementLevel: 'medium',
         },
         null
       )
@@ -899,6 +1778,10 @@ app.post('/api/webhooks/ivr', async (req, res, next) => {
       })
     }
 
+    if (isMongoReady()) {
+      await Lead.findByIdAndUpdate(lead.id, lead, { new: true })
+    }
+
     return res.json({ received: true, callId: call.id })
   } catch (error) {
     return next(error)
@@ -919,7 +1802,7 @@ app.get('/api/webhooks/whatsapp', (req, res) => {
 
 app.post('/api/webhooks/whatsapp', async (req, res, next) => {
   try {
-    let lead = findLead(req.body.leadId) || findLeadByPhone(req.body.from || req.body.phone)
+    let lead = (req.body.leadId ? await findLead(req.body.leadId) : null) || await findLeadByPhone(req.body.from || req.body.phone)
 
     if (!lead) {
       lead = await createLead(
@@ -934,6 +1817,8 @@ app.post('/api/webhooks/whatsapp', async (req, res, next) => {
           requiredSkill: 'whatsapp',
           priority: 'high',
           tags: ['whatsapp', 'auto-created'],
+          interestLevel: 'high',
+          engagementLevel: 'high',
         },
         null
       )
@@ -956,6 +1841,10 @@ app.post('/api/webhooks/whatsapp', async (req, res, next) => {
       description: message.body,
     })
 
+    if (isMongoReady()) {
+      await Lead.findByIdAndUpdate(lead.id, lead, { new: true })
+    }
+
     return res.json({ received: true, messageId: message.id, leadId: lead.id })
   } catch (error) {
     return next(error)
@@ -968,7 +1857,7 @@ app.use((error, _req, res, _next) => {
   }
 
   console.error(error)
-  return res.status(500).json({ message: 'Internal server error' })
+  return res.status(error.statusCode || 500).json({ message: error.statusCode ? error.message : 'Internal server error' })
 })
 
 // Cached Mongo connection promise so concurrent serverless invocations only
@@ -978,7 +1867,7 @@ let mongoConnectionPromise = null
 export async function connectMongo() {
   if (!process.env.MONGO_URI) {
     if (!global.__mongoFallbackWarned) {
-      console.warn('No MONGO_URI provided. Running in demo fallback mode.')
+      console.warn('No MONGO_URI provided. Persistent CRM data is disabled until MongoDB is configured.')
       global.__mongoFallbackWarned = true
     }
     return null
@@ -996,7 +1885,7 @@ export async function connectMongo() {
         return conn
       })
       .catch((error) => {
-        console.warn('MongoDB connection failed. Continuing in demo fallback mode.')
+        console.warn('MongoDB connection failed. Persistent CRM data is unavailable.')
         console.warn(error.message)
         mongoConnectionPromise = null
         return null

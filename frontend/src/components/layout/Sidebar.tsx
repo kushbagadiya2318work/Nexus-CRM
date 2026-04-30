@@ -10,7 +10,8 @@ import {
   Plug,
   Settings,
   Zap,
-  Inbox
+  Inbox,
+  Workflow
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 
@@ -23,6 +24,7 @@ const navigation = [
   { name: 'Analytics', href: '/analytics', icon: BarChart3 },
   { name: 'AI Insights', href: '/ai-insights', icon: Sparkles },
   { name: 'Integrations', href: '/integrations', icon: Plug },
+  { name: 'Automation', href: '/automation', icon: Workflow },
   { name: 'Workflows', href: '/workflows', icon: Zap },
   { name: 'Team Inbox', href: '/inbox', icon: Inbox },
 ]

@@ -12,7 +12,7 @@ This backend provides the API layer for lead capture, calling, WhatsApp messagin
 - WhatsApp Cloud API webhook handler
 - Input validation with Zod
 - Role checks and activity logging
-- In-memory fallback for demo mode if MongoDB is not configured
+- MongoDB-backed persistence for CRM records
 
 ## Quick Start
 
@@ -21,9 +21,13 @@ This backend provides the API layer for lead capture, calling, WhatsApp messagin
    - `npm install`
 3. Start the API:
    - `npm run dev`
-4. Default demo login:
-   - `manager@nexuscrm.ai` / `demo123`
-   - `sales@nexuscrm.ai` / `demo123`
+4. Configure the first admin user in `.env`:
+   - `MONGO_URI=mongodb+srv://...`
+   - `ADMIN_EMAIL=admin@yourcompany.com`
+   - `ADMIN_PASSWORD=use-a-long-secure-password`
+   - `JWT_ACCESS_SECRET=use-a-long-random-secret`
+   - `JWT_REFRESH_SECRET=use-a-different-long-random-secret`
+5. Start the API and sign in with the admin email/password. The admin user is created automatically the first time the API connects to MongoDB.
 
 ## Key Endpoints
 
@@ -32,6 +36,18 @@ This backend provides the API layer for lead capture, calling, WhatsApp messagin
 - `GET /api/leads`
 - `POST /api/leads`
 - `PATCH /api/leads/:id`
+- `GET /api/clients`
+- `POST /api/clients`
+- `PATCH /api/clients/:id`
+- `DELETE /api/clients/:id`
+- `GET /api/deals`
+- `POST /api/deals`
+- `PATCH /api/deals/:id`
+- `DELETE /api/deals/:id`
+- `GET /api/tasks`
+- `POST /api/tasks`
+- `PATCH /api/tasks/:id`
+- `DELETE /api/tasks/:id`
 - `POST /api/leads/:id/calls`
 - `POST /api/leads/:id/messages`
 - `POST /api/webhooks/meta-ads`
@@ -55,4 +71,4 @@ Use either Twilio or Exotel credentials. The sample implementation records call 
 
 ## Suggested Frontend Connection
 
-Point the React frontend to `http://localhost:4000/api` and attach the bearer token from `POST /api/auth/login` in the `Authorization` header.
+Point the React frontend to `http://localhost:4000/api`. The frontend stores the bearer and refresh tokens after `POST /api/auth/login` and hydrates users, leads, clients, deals, and tasks from the API.

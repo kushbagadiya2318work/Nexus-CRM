@@ -12,6 +12,7 @@ import { Button } from '@/components/ui/button'
 import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { useCRMStore } from '@/store'
 import { formatCurrency, formatNumber } from '@/lib/utils'
+import { fetchAnalyticsOverview } from '@/lib/crm-api'
 import { 
   AreaChart, 
   Area, 
@@ -46,9 +47,34 @@ export function AnalyticsPage() {
   const { getRevenueData, getPipelineData, getLeadSources, getTeamPerformance } = useCRMStore()
   const [mounted, setMounted] = useState(false)
   const [timeRange, setTimeRange] = useState('1y')
+  const [liveSummary, setLiveSummary] = useState<{
+    totalLeads: number
+    converted: number
+    conversionRate: number
+    hotLeads: number
+    warmLeads: number
+    coldLeads: number
+    totalValue: number
+    avgScore: number
+  } | null>(null)
+  const [liveSources, setLiveSources] = useState<Array<{
+    source: string
+    leads: number
+    conversions: number
+    conversionRate: number
+    pipelineValue: number
+  }>>([])
+  const [liveFunnel, setLiveFunnel] = useState<Array<{ stage: string; count: number }>>([])
 
   useEffect(() => {
     setMounted(true)
+    fetchAnalyticsOverview().then((result) => {
+      if (result?.data) {
+        setLiveSummary(result.data.summary)
+        setLiveSources(result.data.sourcePerformance)
+        setLiveFunnel(result.data.funnel)
+      }
+    })
   }, [])
 
   const revenueData = getRevenueData()
@@ -56,12 +82,26 @@ export function AnalyticsPage() {
   const leadSources = getLeadSources()
   const teamPerformance = getTeamPerformance()
 
-  const conversionData = [
-    { stage: 'Lead to MQL', rate: 45 },
-    { stage: 'MQL to SQL', rate: 32 },
-    { stage: 'SQL to Opp', rate: 58 },
-    { stage: 'Opp to Win', rate: 25 },
-  ]
+  const conversionData = liveFunnel.length
+    ? liveFunnel.map((item, index, arr) => ({
+        stage: item.stage,
+        rate: index === 0 ? 100 : arr[0].count ? Math.round((item.count / arr[0].count) * 100) : 0,
+      }))
+    : [
+        { stage: 'Lead to MQL', rate: 45 },
+        { stage: 'MQL to SQL', rate: 32 },
+        { stage: 'SQL to Opp', rate: 58 },
+        { stage: 'Opp to Win', rate: 25 },
+      ]
+
+  const leadSourceChartData = liveSources.length
+    ? liveSources.map((entry, index) => ({
+        source: entry.source,
+        count: entry.leads,
+        percentage: Math.round((entry.conversionRate + (entry.leads / Math.max(1, liveSummary?.totalLeads || 1)) * 100) / 2),
+        color: ['#3B82F6', '#10B981', '#F59E0B', '#8B5CF6', '#EC4899', '#06B6D4'][index % 6],
+      }))
+    : leadSources
 
   return (
     <motion.div
@@ -101,8 +141,8 @@ export function AnalyticsPage() {
                 <DollarSign className="w-5 h-5 text-primary" />
               </div>
               <div>
-                <p className="text-2xl font-bold">{formatCurrency(2400000)}</p>
-                <p className="text-sm text-muted">Total Revenue</p>
+                <p className="text-2xl font-bold">{formatCurrency(liveSummary?.totalValue ?? 2400000)}</p>
+                <p className="text-sm text-muted">Pipeline Value</p>
               </div>
             </div>
           </CardContent>
@@ -114,7 +154,7 @@ export function AnalyticsPage() {
                 <TrendingUp className="w-5 h-5 text-emerald-500" />
               </div>
               <div>
-                <p className="text-2xl font-bold">24.8%</p>
+                <p className="text-2xl font-bold">{liveSummary ? `${liveSummary.conversionRate}%` : '24.8%'}</p>
                 <p className="text-sm text-muted">Conversion Rate</p>
               </div>
             </div>
@@ -127,7 +167,7 @@ export function AnalyticsPage() {
                 <Users className="w-5 h-5 text-purple-500" />
               </div>
               <div>
-                <p className="text-2xl font-bold">{formatNumber(674)}</p>
+                <p className="text-2xl font-bold">{formatNumber(liveSummary?.totalLeads ?? 674)}</p>
                 <p className="text-sm text-muted">Total Leads</p>
               </div>
             </div>
@@ -140,8 +180,8 @@ export function AnalyticsPage() {
                 <Target className="w-5 h-5 text-orange-500" />
               </div>
               <div>
-                <p className="text-2xl font-bold">{formatCurrency(15400)}</p>
-                <p className="text-sm text-muted">Avg Deal Size</p>
+                <p className="text-2xl font-bold">{liveSummary ? `${liveSummary.avgScore}` : formatCurrency(15400)}</p>
+                <p className="text-sm text-muted">{liveSummary ? 'Average Lead Score' : 'Avg Deal Size'}</p>
               </div>
             </div>
           </CardContent>
@@ -251,7 +291,7 @@ export function AnalyticsPage() {
                 <ResponsiveContainer width="100%" height="100%">
                   <RePieChart>
                     <Pie
-                      data={leadSources}
+                      data={leadSourceChartData}
                       cx="50%"
                       cy="50%"
                       innerRadius={60}
@@ -260,7 +300,7 @@ export function AnalyticsPage() {
                       dataKey="count"
                       label={({ source, percentage }) => `${source}: ${percentage}%`}
                     >
-                      {leadSources.map((entry, index) => (
+                      {leadSourceChartData.map((entry, index) => (
                         <Cell key={`cell-${index}`} fill={entry.color} />
                       ))}
                     </Pie>
