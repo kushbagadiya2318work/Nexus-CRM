@@ -1,9 +1,9 @@
 {
-  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "version": 2,
   "framework": "vite",
   "installCommand": "npm install",
   "buildCommand": "npm run build",
-  "outputDirectory": "src/dist",
+  "outputDirectory": "dist",
   "functions": {
     "api/index.js": {
       "runtime": "@vercel/node"
@@ -13,10 +13,9 @@
     {
       "source": "/api/(.*)",
       "destination": "/api/index"
-    },
-    {
-      "source": "/((?!api/).*)",
-      "destination": "/index.html"
     }
-  ]
+  ],
+  "env": {
+    "NODE_ENV": "production"
+  }
 }
