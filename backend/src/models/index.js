@@ -261,3 +261,75 @@ export const Deal = mongoose.models.Deal || mongoose.model('Deal', dealSchema)
 export const Task = mongoose.models.Task || mongoose.model('Task', taskSchema)
 export const ActivityLog = mongoose.models.ActivityLog || mongoose.model('ActivityLog', activityLogSchema)
 export const RefreshToken = mongoose.models.RefreshToken || mongoose.model('RefreshToken', refreshTokenSchema)
+
+// ---- Web Push subscription ------------------------------------------------
+const pushSubscriptionSchema = new mongoose.Schema(
+  {
+    userId: { type: String, required: true, index: true },
+    endpoint: { type: String, required: true, unique: true },
+    keys: {
+      p256dh: String,
+      auth: String,
+    },
+    userAgent: String,
+  },
+  { timestamps: true }
+)
+
+export const PushSubscription =
+  mongoose.models.PushSubscription || mongoose.model('PushSubscription', pushSubscriptionSchema)
+
+// ---- Workflow automation --------------------------------------------------
+const workflowConditionSchema = new mongoose.Schema(
+  {
+    trigger: String,
+    operator: String,
+    value: String,
+  },
+  { _id: true }
+)
+
+const workflowActionSchema = new mongoose.Schema(
+  {
+    type: String,
+    config: { type: mongoose.Schema.Types.Mixed, default: {} },
+  },
+  { _id: true }
+)
+
+const workflowSchema = new mongoose.Schema(
+  {
+    name: { type: String, required: true, trim: true },
+    description: String,
+    enabled: { type: Boolean, default: true },
+    triggerType: { type: String, default: 'event' },
+    eventTypes: [String],
+    entityType: { type: String, enum: ['lead', 'deal', 'task', 'client'], default: 'lead' },
+    conditions: [workflowConditionSchema],
+    actions: [workflowActionSchema],
+    createdBy: String,
+  },
+  { timestamps: true }
+)
+
+export const Workflow = mongoose.models.Workflow || mongoose.model('Workflow', workflowSchema)
+
+const workflowExecutionSchema = new mongoose.Schema(
+  {
+    workflowId: { type: mongoose.Schema.Types.ObjectId, ref: 'Workflow', required: true, index: true },
+    entityType: String,
+    entityId: String,
+    eventType: String,
+    status: { type: String, enum: ['success', 'failed', 'skipped'], default: 'success' },
+    actorId: String,
+    actorName: String,
+    actionsRun: [{ type: mongoose.Schema.Types.Mixed }],
+    error: String,
+  },
+  { timestamps: true }
+)
+
+workflowExecutionSchema.index({ workflowId: 1, createdAt: -1 })
+
+export const WorkflowExecution =
+  mongoose.models.WorkflowExecution || mongoose.model('WorkflowExecution', workflowExecutionSchema)
