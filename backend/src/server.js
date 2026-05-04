@@ -8,8 +8,8 @@ import bcrypt from 'bcryptjs'
 import cookieParser from 'cookie-parser'
 import mongoose from 'mongoose'
 import { z } from 'zod'
-import { randomUUID } from 'node:crypto'
-import { ActivityLog, Client, Deal, Lead, Task, User } from './models/index.js'
+import { randomUUID, createHmac, timingSafeEqual } from 'node:crypto'
+import { ActivityLog, Client, Deal, Lead, PushSubscription, Task, User, Workflow, WorkflowExecution } from './models/index.js'
 import {
   fetchMetaLead,
   getIntegrationStatus,
@@ -21,6 +21,11 @@ import {
   transcribeRecording,
   triggerClickToCall,
 } from './services/integrations.js'
+import { attachRealtime, broadcast as realtimeBroadcast, realtimeStatus } from './realtime.js'
+import { rowsToCsv, parseCsv } from './utils/csv.js'
+import { generateAiReply, aiStatus } from './services/ai.js'
+import { initWebPush, pushStatus, sendPush } from './services/push.js'
+import { triggerWorkflows } from './services/workflows.js'
 
 const app = express()
 const PORT = Number(process.env.PORT || 4000)
@@ -69,12 +74,168 @@ app.use(
     credentials: true,
   })
 )
-app.use(express.json({ limit: '2mb' }))
-app.use(express.urlencoded({ extended: true }))
+app.use(express.json({
+  limit: '2mb',
+  verify(req, _res, buf) {
+    // Preserve raw body bytes for webhook signature verification.
+    req.rawBody = Buffer.isBuffer(buf) ? buf : Buffer.from(buf || '')
+  },
+}))
+app.use(express.urlencoded({
+  extended: true,
+  verify(req, _res, buf) {
+    if (!req.rawBody) {
+      req.rawBody = Buffer.isBuffer(buf) ? buf : Buffer.from(buf || '')
+    }
+  },
+}))
 app.use(cookieParser())
 if (process.env.NODE_ENV !== 'production') {
   app.use(morgan('dev'))
 }
+
+// ---- Webhook signature verification ---------------------------------------
+
+function safeEqual(a, b) {
+  const ab = Buffer.from(a || '', 'utf8')
+  const bb = Buffer.from(b || '', 'utf8')
+  if (ab.length !== bb.length) return false
+  try {
+    return timingSafeEqual(ab, bb)
+  } catch {
+    return false
+  }
+}
+
+function verifyMetaSignature(req, _res, next) {
+  const secret = process.env.META_APP_SECRET
+  // If no secret configured, skip (dev mode) but warn.
+  if (!secret) {
+    if (!global.__metaSecretWarned) {
+      console.warn('META_APP_SECRET is not set. Meta webhook signatures are NOT being verified.')
+      global.__metaSecretWarned = true
+    }
+    return next()
+  }
+  const header = req.get('x-hub-signature-256') || ''
+  if (!header.startsWith('sha256=')) {
+    return next({ statusCode: 401, message: 'Missing Meta webhook signature' })
+  }
+  const expected = createHmac('sha256', secret).update(req.rawBody || Buffer.alloc(0)).digest('hex')
+  if (!safeEqual(header.slice(7), expected)) {
+    return next({ statusCode: 401, message: 'Invalid Meta webhook signature' })
+  }
+  return next()
+}
+
+function verifyWhatsAppSignature(req, _res, next) {
+  // WhatsApp Cloud API also uses x-hub-signature-256 with the App Secret.
+  const secret = process.env.WHATSAPP_APP_SECRET || process.env.META_APP_SECRET
+  if (!secret) {
+    if (!global.__waSecretWarned) {
+      console.warn('WHATSAPP_APP_SECRET is not set. WhatsApp webhook signatures are NOT being verified.')
+      global.__waSecretWarned = true
+    }
+    return next()
+  }
+  const header = req.get('x-hub-signature-256') || ''
+  if (!header.startsWith('sha256=')) {
+    return next({ statusCode: 401, message: 'Missing WhatsApp webhook signature' })
+  }
+  const expected = createHmac('sha256', secret).update(req.rawBody || Buffer.alloc(0)).digest('hex')
+  if (!safeEqual(header.slice(7), expected)) {
+    return next({ statusCode: 401, message: 'Invalid WhatsApp webhook signature' })
+  }
+  return next()
+}
+
+function verifyTwilioSignature(req, _res, next) {
+  const token = process.env.TWILIO_AUTH_TOKEN
+  if (!token) {
+    if (!global.__twilioSecretWarned) {
+      console.warn('TWILIO_AUTH_TOKEN is not set. Twilio webhook signatures are NOT being verified.')
+      global.__twilioSecretWarned = true
+    }
+    return next()
+  }
+  // Twilio computes HMAC-SHA1 over (URL + sorted form params concatenated).
+  const provided = req.get('x-twilio-signature') || ''
+  if (!provided) {
+    return next({ statusCode: 401, message: 'Missing Twilio signature' })
+  }
+  const proto = req.get('x-forwarded-proto') || req.protocol
+  const host = req.get('x-forwarded-host') || req.get('host')
+  const url = `${proto}://${host}${req.originalUrl}`
+  const params = req.body && typeof req.body === 'object' ? req.body : {}
+  const sortedKeys = Object.keys(params).sort()
+  const data = url + sortedKeys.map((key) => `${key}${params[key]}`).join('')
+  const expected = createHmac('sha1', token).update(data).digest('base64')
+  if (!safeEqual(provided, expected)) {
+    return next({ statusCode: 401, message: 'Invalid Twilio signature' })
+  }
+  return next()
+}
+
+// Generic shared-secret verifier (for Exotel/Zapier/Make/Slack inbound).
+function verifySharedSecret(headerName, envVar) {
+  return (req, _res, next) => {
+    const expected = process.env[envVar]
+    if (!expected) return next() // not configured -> skip
+    const provided = req.get(headerName) || req.query.token || req.body?.token
+    if (!safeEqual(String(provided || ''), expected)) {
+      return next({ statusCode: 401, message: `Invalid ${headerName} signature` })
+    }
+    return next()
+  }
+}
+
+// ---- Rate limiting --------------------------------------------------------
+// Lightweight in-memory sliding-window limiter. Acceptable as per-instance
+// soft protection. For production scale, place a global limiter (Cloudflare,
+// API gateway, or Redis-backed) in front of the API.
+
+const rateBuckets = new Map()
+
+function clientKey(req) {
+  const fwd = req.get('x-forwarded-for')
+  const ip = (fwd ? fwd.split(',')[0].trim() : null) || req.ip || req.socket?.remoteAddress || 'unknown'
+  return ip
+}
+
+function rateLimit({ windowMs, max, scope = 'global', keyFn = clientKey }) {
+  return (req, res, next) => {
+    const key = `${scope}:${keyFn(req)}`
+    const now = Date.now()
+    const bucket = rateBuckets.get(key) || []
+    // Drop entries outside the window
+    while (bucket.length && bucket[0] <= now - windowMs) bucket.shift()
+    if (bucket.length >= max) {
+      const retryAfter = Math.ceil((bucket[0] + windowMs - now) / 1000)
+      res.set('Retry-After', String(Math.max(1, retryAfter)))
+      res.set('X-RateLimit-Limit', String(max))
+      res.set('X-RateLimit-Remaining', '0')
+      return res.status(429).json({ message: 'Too many requests. Please slow down.' })
+    }
+    bucket.push(now)
+    rateBuckets.set(key, bucket)
+    res.set('X-RateLimit-Limit', String(max))
+    res.set('X-RateLimit-Remaining', String(Math.max(0, max - bucket.length)))
+    return next()
+  }
+}
+
+// Periodically prune empty buckets so the map doesn't grow unbounded.
+setInterval(() => {
+  const cutoff = Date.now() - 10 * 60 * 1000
+  for (const [key, bucket] of rateBuckets) {
+    while (bucket.length && bucket[0] <= cutoff) bucket.shift()
+    if (!bucket.length) rateBuckets.delete(key)
+  }
+}, 60 * 1000).unref?.()
+
+const authRateLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 20, scope: 'auth' })
+const captureRateLimiter = rateLimit({ windowMs: 60 * 1000, max: 30, scope: 'capture' })
+const webhookRateLimiter = rateLimit({ windowMs: 60 * 1000, max: 300, scope: 'webhook' })
 
 const authSchema = z.object({
   email: z.string().email(),
@@ -87,7 +248,7 @@ const leadPayloadSchema = z.object({
   email: z.string().email().optional(),
   company: z.string().optional(),
   source: z.enum(['manual', 'meta_ads', 'api', 'whatsapp', 'ivr', 'website', 'referral', 'linkedin', 'email', 'event', 'other']).default('manual'),
-  status: z.enum(['new', 'contacted', 'interested', 'not_interested', 'converted']).optional(),
+  status: z.enum(['new', 'contacted', 'interested', 'not_interested', 'converted', 'qualified', 'proposal', 'negotiation', 'won', 'lost']).optional(),
   notes: z.string().optional(),
   assignedTo: z.string().optional(),
   priority: z.enum(['low', 'medium', 'high']).optional(),
@@ -602,6 +763,57 @@ async function writeActivity(action, entityType, entityId, metadata = {}, actor 
       console.warn('Activity log persistence skipped:', error.message)
     }
   }
+
+  // Push to all connected websocket clients (best-effort, non-blocking).
+  try {
+    realtimeBroadcast('activity', entry, { exceptUserId: entry.actorId })
+    realtimeBroadcast(`${entityType}.${action.split('.').pop()}`, { id: entityId, metadata, actorId: entry.actorId })
+  } catch {
+    // ignore broadcast errors
+  }
+
+  // Fire workflow engine for lead/deal/task events (best-effort).
+  if (['lead', 'deal', 'task'].includes(entityType)) {
+    try {
+      let entity = null
+      if (entityType === 'lead') entity = await findLeadFull(entityId)
+      else if (entityType === 'deal') entity = await findDealFull(entityId)
+      else if (entityType === 'task') entity = await findTaskFull(entityId)
+      if (entity) {
+        triggerWorkflows(
+          { type: action, entityType },
+          entity,
+          { id: entry.actorId, name: entry.actorName }
+        ).catch((err) => console.warn('[workflow] trigger failed', err?.message))
+      }
+    } catch (error) {
+      console.warn('[workflow] resolve entity failed', error?.message)
+    }
+  }
+}
+
+async function findLeadFull(id) {
+  if (isMongoReady()) {
+    const doc = await Lead.findById(id).lean()
+    return doc ? { ...doc, id: String(doc._id) } : null
+  }
+  return store.leads.find((l) => l.id === id) || null
+}
+
+async function findDealFull(id) {
+  if (isMongoReady()) {
+    const doc = await Deal.findById(id).lean()
+    return doc ? { ...doc, id: String(doc._id) } : null
+  }
+  return store.deals.find((d) => d.id === id) || null
+}
+
+async function findTaskFull(id) {
+  if (isMongoReady()) {
+    const doc = await Task.findById(id).lean()
+    return doc ? { ...doc, id: String(doc._id) } : null
+  }
+  return store.tasks.find((t) => t.id === id) || null
 }
 
 async function findLead(leadId) {
@@ -903,62 +1115,243 @@ async function createLead(payload, actor = null) {
   return persistedLead
 }
 
+// ---- Pagination / sorting / filtering helpers ------------------------------
+
+function parsePagination(query = {}) {
+  const limitRaw = Number(query.limit)
+  const offsetRaw = Number(query.offset)
+  const pageRaw = Number(query.page)
+  const limit = Number.isFinite(limitRaw) && limitRaw > 0 ? Math.min(500, Math.floor(limitRaw)) : null
+  let offset = Number.isFinite(offsetRaw) && offsetRaw >= 0 ? Math.floor(offsetRaw) : 0
+  if (!offset && Number.isFinite(pageRaw) && pageRaw > 1 && limit) {
+    offset = (Math.floor(pageRaw) - 1) * limit
+  }
+  return { limit, offset }
+}
+
+function parseSort(value, allowed, fallback) {
+  if (!value) return fallback
+  const direction = String(value).startsWith('-') ? -1 : 1
+  const field = String(value).replace(/^[-+]/, '')
+  if (!allowed.includes(field)) return fallback
+  return { [field]: direction }
+}
+
+function buildDateRange(field, query = {}) {
+  const from = query[`${field}From`] || query.dateFrom
+  const to = query[`${field}To`] || query.dateTo
+  const range = {}
+  if (from && !Number.isNaN(Date.parse(from))) range.$gte = new Date(from)
+  if (to && !Number.isNaN(Date.parse(to))) range.$lte = new Date(to)
+  return Object.keys(range).length ? range : null
+}
+
+function applyInMemorySort(items, sort) {
+  if (!sort) return items
+  const [field, direction] = Object.entries(sort)[0]
+  return [...items].sort((a, b) => {
+    const av = a?.[field]
+    const bv = b?.[field]
+    if (av == null && bv == null) return 0
+    if (av == null) return 1
+    if (bv == null) return -1
+    if (av < bv) return -1 * direction
+    if (av > bv) return 1 * direction
+    return 0
+  })
+}
+
+function applyInMemoryDateRange(items, field, range) {
+  if (!range) return items
+  return items.filter((item) => {
+    const ts = item?.[field] ? new Date(item[field]).getTime() : NaN
+    if (Number.isNaN(ts)) return false
+    if (range.$gte && ts < range.$gte.getTime()) return false
+    if (range.$lte && ts > range.$lte.getTime()) return false
+    return true
+  })
+}
+
+function paginate(items, { limit, offset }) {
+  if (!limit) return items
+  return items.slice(offset, offset + limit)
+}
+
+const LEAD_SORT_FIELDS = ['createdAt', 'updatedAt', 'score', 'lastActivity', 'nextFollowUp', 'name']
+const CLIENT_SORT_FIELDS = ['createdAt', 'updatedAt', 'name', 'healthScore', 'lifetimeValue', 'lastContact', 'renewalDate']
+const DEAL_SORT_FIELDS = ['createdAt', 'updatedAt', 'value', 'expectedCloseDate', 'stage', 'probability', 'name']
+const TASK_SORT_FIELDS = ['createdAt', 'updatedAt', 'dueDate', 'priority', 'status', 'title']
+
 async function listLeads(filters = {}) {
+  const sort = parseSort(filters.sort, LEAD_SORT_FIELDS, { createdAt: -1 })
+  const dateRange = buildDateRange('createdAt', filters)
+  const pagination = parsePagination(filters)
+  const search = String(filters.q || '').toLowerCase()
+
   if (isMongoReady()) {
     const query = {}
     if (filters.status) query.status = filters.status
     if (filters.source) query.source = filters.source
     if (filters.assignedTo) query.assignedTo = filters.assignedTo
-
-    let records = (await Lead.find(query).sort({ createdAt: -1 })).map(serializeLead)
-    const search = String(filters.q || '').toLowerCase()
+    if (filters.segment) query.segment = filters.segment
+    if (filters.priority) query.priority = filters.priority
+    if (dateRange) query.createdAt = dateRange
     if (search) {
-      records = records.filter((lead) =>
-        [lead.name, lead.email, lead.phone, lead.company].filter(Boolean).some((value) => value.toLowerCase().includes(search))
-      )
+      const safe = search.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+      const rx = new RegExp(safe, 'i')
+      query.$or = [{ name: rx }, { email: rx }, { phone: rx }, { company: rx }]
     }
-    return records
+
+    const total = await Lead.countDocuments(query)
+    let cursor = Lead.find(query).sort(sort)
+    if (pagination.limit) cursor = cursor.skip(pagination.offset).limit(pagination.limit)
+    const records = (await cursor).map(serializeLead)
+    return { data: records, total, limit: pagination.limit, offset: pagination.offset }
   }
 
-  const { status, source, assignedTo, q } = filters
-  return store.leads.filter((lead) => {
-    const matchesStatus = !status || lead.status === status
-    const matchesSource = !source || lead.source === source
-    const matchesAssigned = !assignedTo || lead.assignedTo === assignedTo
-    const search = String(q || '').toLowerCase()
-    const matchesQuery =
-      !search ||
-      lead.name.toLowerCase().includes(search) ||
-      lead.email.toLowerCase().includes(search) ||
-      lead.phone.toLowerCase().includes(search) ||
-      lead.company.toLowerCase().includes(search)
-
-    return matchesStatus && matchesSource && matchesAssigned && matchesQuery
+  let items = store.leads.filter((lead) => {
+    if (filters.status && lead.status !== filters.status) return false
+    if (filters.source && lead.source !== filters.source) return false
+    if (filters.assignedTo && lead.assignedTo !== filters.assignedTo) return false
+    if (filters.segment && lead.segment !== filters.segment) return false
+    if (filters.priority && lead.priority !== filters.priority) return false
+    if (search) {
+      const haystack = [lead.name, lead.email, lead.phone, lead.company].filter(Boolean).join(' ').toLowerCase()
+      if (!haystack.includes(search)) return false
+    }
+    return true
   })
+
+  items = applyInMemoryDateRange(items, 'createdAt', dateRange)
+  items = applyInMemorySort(items, sort)
+  const total = items.length
+  return { data: paginate(items, pagination), total, limit: pagination.limit, offset: pagination.offset }
 }
 
-async function listClients() {
+async function listClients(filters = {}) {
+  const sort = parseSort(filters.sort, CLIENT_SORT_FIELDS, { createdAt: -1 })
+  const dateRange = buildDateRange('createdAt', filters)
+  const pagination = parsePagination(filters)
+  const search = String(filters.q || '').toLowerCase()
+
   if (isMongoReady()) {
-    return (await Client.find().sort({ createdAt: -1 })).map(serializeClient)
+    const query = {}
+    if (filters.status) query.status = filters.status
+    if (filters.segment) query.segment = filters.segment
+    if (filters.accountOwnerId) query.accountOwnerId = filters.accountOwnerId
+    if (dateRange) query.createdAt = dateRange
+    if (search) {
+      const safe = search.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+      const rx = new RegExp(safe, 'i')
+      query.$or = [{ name: rx }, { email: rx }, { phone: rx }, { company: rx }]
+    }
+    const total = await Client.countDocuments(query)
+    let cursor = Client.find(query).sort(sort)
+    if (pagination.limit) cursor = cursor.skip(pagination.offset).limit(pagination.limit)
+    const records = (await cursor).map(serializeClient)
+    return { data: records, total, limit: pagination.limit, offset: pagination.offset }
   }
 
-  return store.clients
+  let items = store.clients.filter((client) => {
+    if (filters.status && client.status !== filters.status) return false
+    if (filters.segment && client.segment !== filters.segment) return false
+    if (filters.accountOwnerId && client.accountOwnerId !== filters.accountOwnerId) return false
+    if (search) {
+      const haystack = [client.name, client.email, client.phone, client.company].filter(Boolean).join(' ').toLowerCase()
+      if (!haystack.includes(search)) return false
+    }
+    return true
+  })
+  items = applyInMemoryDateRange(items, 'createdAt', dateRange)
+  items = applyInMemorySort(items, sort)
+  const total = items.length
+  return { data: paginate(items, pagination), total, limit: pagination.limit, offset: pagination.offset }
 }
 
-async function listDeals() {
+async function listDeals(filters = {}) {
+  const sort = parseSort(filters.sort, DEAL_SORT_FIELDS, { updatedAt: -1, createdAt: -1 })
+  const dateRange = buildDateRange('createdAt', filters)
+  const pagination = parsePagination(filters)
+  const search = String(filters.q || '').toLowerCase()
+
   if (isMongoReady()) {
-    return (await Deal.find().sort({ updatedAt: -1, createdAt: -1 })).map(serializeRecord)
+    const query = {}
+    if (filters.stage) query.stage = filters.stage
+    if (filters.assignedTo) query.assignedTo = filters.assignedTo
+    if (filters.priority) query.priority = filters.priority
+    if (filters.clientId) query.clientId = filters.clientId
+    if (dateRange) query.createdAt = dateRange
+    if (search) {
+      const safe = search.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+      const rx = new RegExp(safe, 'i')
+      query.$or = [{ name: rx }, { clientName: rx }, { description: rx }]
+    }
+    const total = await Deal.countDocuments(query)
+    let cursor = Deal.find(query).sort(sort)
+    if (pagination.limit) cursor = cursor.skip(pagination.offset).limit(pagination.limit)
+    const records = (await cursor).map(serializeRecord)
+    return { data: records, total, limit: pagination.limit, offset: pagination.offset }
   }
 
-  return store.deals
+  let items = store.deals.filter((deal) => {
+    if (filters.stage && deal.stage !== filters.stage) return false
+    if (filters.assignedTo && deal.assignedTo !== filters.assignedTo) return false
+    if (filters.priority && deal.priority !== filters.priority) return false
+    if (filters.clientId && deal.clientId !== filters.clientId) return false
+    if (search) {
+      const haystack = [deal.name, deal.clientName, deal.description].filter(Boolean).join(' ').toLowerCase()
+      if (!haystack.includes(search)) return false
+    }
+    return true
+  })
+  items = applyInMemoryDateRange(items, 'createdAt', dateRange)
+  items = applyInMemorySort(items, sort)
+  const total = items.length
+  return { data: paginate(items, pagination), total, limit: pagination.limit, offset: pagination.offset }
 }
 
-async function listTasks() {
+async function listTasks(filters = {}) {
+  const sort = parseSort(filters.sort, TASK_SORT_FIELDS, { dueDate: 1, createdAt: -1 })
+  const dateRange = buildDateRange('dueDate', filters)
+  const pagination = parsePagination(filters)
+  const search = String(filters.q || '').toLowerCase()
+
   if (isMongoReady()) {
-    return (await Task.find().sort({ dueDate: 1, createdAt: -1 })).map(serializeRecord)
+    const query = {}
+    if (filters.status) query.status = filters.status
+    if (filters.assignedTo) query.assignedTo = filters.assignedTo
+    if (filters.priority) query.priority = filters.priority
+    if (filters.relatedType) query['relatedTo.type'] = filters.relatedType
+    if (filters.relatedId) query['relatedTo.id'] = filters.relatedId
+    if (dateRange) query.dueDate = dateRange
+    if (search) {
+      const safe = search.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+      const rx = new RegExp(safe, 'i')
+      query.$or = [{ title: rx }, { description: rx }]
+    }
+    const total = await Task.countDocuments(query)
+    let cursor = Task.find(query).sort(sort)
+    if (pagination.limit) cursor = cursor.skip(pagination.offset).limit(pagination.limit)
+    const records = (await cursor).map(serializeRecord)
+    return { data: records, total, limit: pagination.limit, offset: pagination.offset }
   }
 
-  return store.tasks
+  let items = store.tasks.filter((task) => {
+    if (filters.status && task.status !== filters.status) return false
+    if (filters.assignedTo && task.assignedTo !== filters.assignedTo) return false
+    if (filters.priority && task.priority !== filters.priority) return false
+    if (filters.relatedType && task.relatedTo?.type !== filters.relatedType) return false
+    if (filters.relatedId && task.relatedTo?.id !== filters.relatedId) return false
+    if (search) {
+      const haystack = [task.title, task.description].filter(Boolean).join(' ').toLowerCase()
+      if (!haystack.includes(search)) return false
+    }
+    return true
+  })
+  items = applyInMemoryDateRange(items, 'dueDate', dateRange)
+  items = applyInMemorySort(items, sort)
+  const total = items.length
+  return { data: paginate(items, pagination), total, limit: pagination.limit, offset: pagination.offset }
 }
 
 function buildAnalyticsFromLeads(leads) {
@@ -1046,13 +1439,242 @@ function getAutomationBlueprint() {
   }
 }
 
+// Lightweight liveness probe — no DB/integration calls, safe for uptime checks.
+const livenessHandler = (_req, res) => {
+  res.json({
+    status: 'ok',
+    service: 'nexus-crm-backend',
+    time: new Date().toISOString(),
+    uptime: process.uptime(),
+  })
+}
+app.get('/health', livenessHandler)
+app.get('/api/ping', livenessHandler)
+
 app.get('/api/health', (_req, res) => {
   res.json({
     status: 'ok',
     time: new Date().toISOString(),
+    uptime: process.uptime(),
     mongo: mongoose.connection.readyState === 1 ? 'connected' : 'not-configured',
     integrations: getIntegrationStatus(),
+    realtime: realtimeStatus(),
+    ai: aiStatus(),
+    push: pushStatus(),
   })
+})
+
+const aiChatSchema = z.object({
+  message: z.string().min(1).max(4000),
+  history: z
+    .array(
+      z.object({
+        role: z.enum(['user', 'assistant', 'system']),
+        content: z.string().max(8000),
+      })
+    )
+    .max(20)
+    .optional(),
+  context: z.record(z.any()).optional(),
+})
+
+app.post('/api/ai/chat', authenticate, async (req, res) => {
+  const parsed = aiChatSchema.safeParse(req.body)
+  if (!parsed.success) {
+    return res.status(400).json({ error: 'Invalid request', details: parsed.error.flatten() })
+  }
+  try {
+    const result = await generateAiReply({
+      message: parsed.data.message,
+      history: parsed.data.history || [],
+      context: parsed.data.context || {},
+      user: req.user,
+    })
+    res.json(result)
+  } catch (error) {
+    const status = error?.statusCode || 500
+    res.status(status).json({ error: error?.message || 'AI request failed' })
+  }
+})
+
+const pushSubscribeSchema = z.object({
+  subscription: z.object({
+    endpoint: z.string().url(),
+    keys: z.object({
+      p256dh: z.string(),
+      auth: z.string(),
+    }),
+  }),
+  userAgent: z.string().optional(),
+})
+
+app.get('/api/push/public-key', (_req, res) => {
+  res.json({ publicKey: process.env.VAPID_PUBLIC_KEY || null })
+})
+
+app.post('/api/push/subscribe', authenticate, async (req, res) => {
+  const parsed = pushSubscribeSchema.safeParse(req.body)
+  if (!parsed.success) return res.status(400).json({ error: 'Invalid subscription' })
+  if (mongoose.connection.readyState !== 1) {
+    return res.status(503).json({ error: 'Database not connected' })
+  }
+  const { subscription, userAgent } = parsed.data
+  await PushSubscription.findOneAndUpdate(
+    { endpoint: subscription.endpoint },
+    {
+      userId: req.user.id,
+      endpoint: subscription.endpoint,
+      keys: subscription.keys,
+      userAgent: userAgent || req.headers['user-agent'] || null,
+    },
+    { upsert: true, new: true }
+  )
+  res.json({ ok: true })
+})
+
+app.post('/api/push/unsubscribe', authenticate, async (req, res) => {
+  const endpoint = req.body?.endpoint
+  if (!endpoint) return res.status(400).json({ error: 'Missing endpoint' })
+  if (mongoose.connection.readyState !== 1) return res.json({ ok: true })
+  await PushSubscription.deleteOne({ endpoint, userId: req.user.id })
+  res.json({ ok: true })
+})
+
+app.post('/api/push/test', authenticate, async (req, res) => {
+  if (mongoose.connection.readyState !== 1) {
+    return res.status(503).json({ error: 'Database not connected' })
+  }
+  if (!initWebPush()) {
+    return res.status(503).json({ error: 'VAPID keys not configured' })
+  }
+  const subs = await PushSubscription.find({ userId: req.user.id }).lean()
+  const payload = {
+    title: req.body?.title || 'Nexus CRM',
+    body: req.body?.body || 'This is a test notification.',
+    url: req.body?.url || '/',
+  }
+  const results = await Promise.all(
+    subs.map(async (sub) => {
+      const result = await sendPush(
+        { endpoint: sub.endpoint, keys: sub.keys },
+        payload
+      )
+      if (result.gone) {
+        await PushSubscription.deleteOne({ endpoint: sub.endpoint })
+      }
+      return { endpoint: sub.endpoint, ...result }
+    })
+  )
+  res.json({ sent: results.length, results })
+})
+
+async function notifyUserPush(userId, payload) {
+  if (!userId) return
+  if (mongoose.connection.readyState !== 1) return
+  if (!initWebPush()) return
+  try {
+    const subs = await PushSubscription.find({ userId }).lean()
+    await Promise.all(
+      subs.map(async (sub) => {
+        const result = await sendPush({ endpoint: sub.endpoint, keys: sub.keys }, payload)
+        if (result.gone) {
+          await PushSubscription.deleteOne({ endpoint: sub.endpoint })
+        }
+      })
+    )
+  } catch (error) {
+    console.warn('[push] notifyUserPush failed', error?.message)
+  }
+}
+
+const workflowConditionSchema = z.object({
+  id: z.string().optional(),
+  trigger: z.string(),
+  operator: z.string(),
+  value: z.string(),
+})
+const workflowActionSchema = z.object({
+  id: z.string().optional(),
+  type: z.string(),
+  config: z.record(z.any()).optional(),
+})
+const workflowPayloadSchema = z.object({
+  name: z.string().min(1),
+  description: z.string().optional(),
+  isActive: z.boolean().optional(),
+  triggerLogic: z.enum(['AND', 'OR']).optional(),
+  conditions: z.array(workflowConditionSchema).default([]),
+  actions: z.array(workflowActionSchema).default([]),
+})
+
+function serializeWorkflow(doc) {
+  if (!doc) return null
+  const obj = typeof doc.toObject === 'function' ? doc.toObject({ virtuals: true }) : doc
+  return {
+    ...obj,
+    id: String(obj._id || obj.id),
+    _id: undefined,
+  }
+}
+
+app.get('/api/workflows', authenticate, async (_req, res, next) => {
+  try {
+    if (!isMongoReady()) return res.json({ data: [] })
+    const workflows = await Workflow.find().sort({ createdAt: -1 }).lean()
+    res.json({ data: workflows.map(serializeWorkflow) })
+  } catch (error) {
+    next(error)
+  }
+})
+
+app.post('/api/workflows', authenticate, requireRoles('admin', 'manager'), async (req, res, next) => {
+  try {
+    const payload = workflowPayloadSchema.parse(req.body)
+    if (!isMongoReady()) return res.status(503).json({ error: 'Database not connected' })
+    const created = await Workflow.create({ ...payload, createdBy: req.user.id })
+    await writeActivity('workflow.created', 'workflow', String(created._id), { name: payload.name }, req.user)
+    res.status(201).json({ data: serializeWorkflow(created) })
+  } catch (error) {
+    next(error)
+  }
+})
+
+app.patch('/api/workflows/:id', authenticate, requireRoles('admin', 'manager'), async (req, res, next) => {
+  try {
+    const updates = workflowPayloadSchema.partial().parse(req.body)
+    if (!isMongoReady()) return res.status(503).json({ error: 'Database not connected' })
+    const saved = await Workflow.findByIdAndUpdate(req.params.id, updates, { new: true })
+    if (!saved) return res.status(404).json({ error: 'Workflow not found' })
+    await writeActivity('workflow.updated', 'workflow', req.params.id, updates, req.user)
+    res.json({ data: serializeWorkflow(saved) })
+  } catch (error) {
+    next(error)
+  }
+})
+
+app.delete('/api/workflows/:id', authenticate, requireRoles('admin'), async (req, res, next) => {
+  try {
+    if (!isMongoReady()) return res.status(503).json({ error: 'Database not connected' })
+    const removed = await Workflow.findByIdAndDelete(req.params.id)
+    if (!removed) return res.status(404).json({ error: 'Workflow not found' })
+    await writeActivity('workflow.deleted', 'workflow', req.params.id, {}, req.user)
+    res.json({ ok: true })
+  } catch (error) {
+    next(error)
+  }
+})
+
+app.get('/api/workflows/:id/executions', authenticate, async (req, res, next) => {
+  try {
+    if (!isMongoReady()) return res.json({ data: [] })
+    const items = await WorkflowExecution.find({ workflowId: req.params.id })
+      .sort({ createdAt: -1 })
+      .limit(50)
+      .lean()
+    res.json({ data: items })
+  } catch (error) {
+    next(error)
+  }
 })
 
 app.get('/api/automation/blueprint', authenticate, (_req, res) => {
@@ -1061,14 +1683,14 @@ app.get('/api/automation/blueprint', authenticate, (_req, res) => {
 
 app.get('/api/analytics/overview', authenticate, async (_req, res, next) => {
   try {
-    const leads = await listLeads()
-    res.json({ data: buildAnalyticsFromLeads(leads) })
+    const result = await listLeads()
+    res.json({ data: buildAnalyticsFromLeads(result.data) })
   } catch (error) {
     next(error)
   }
 })
 
-app.post('/api/auth/login', async (req, res, next) => {
+app.post('/api/auth/login', authRateLimiter, async (req, res, next) => {
   try {
     const { email, password } = authSchema.parse(req.body)
     let user = null
@@ -1098,7 +1720,7 @@ app.post('/api/auth/login', async (req, res, next) => {
   }
 })
 
-app.post('/api/auth/refresh', (req, res) => {
+app.post('/api/auth/refresh', authRateLimiter, (req, res) => {
   const refreshToken = req.body.refreshToken || req.cookies.refreshToken
 
   if (!refreshToken || !store.refreshTokens.has(refreshToken)) {
@@ -1147,10 +1769,113 @@ app.get('/api/users', authenticate, async (_req, res, next) => {
   }
 })
 
-app.get('/api/clients', authenticate, async (_req, res, next) => {
+const userCreateSchema = z.object({
+  name: z.string().min(2),
+  email: z.string().email(),
+  password: z.string().min(8),
+  role: z.enum(['admin', 'manager', 'sales', 'viewer']).default('sales'),
+  status: z.enum(['active', 'inactive']).default('active'),
+  department: z.enum(['inbound', 'outbound', 'enterprise', 'support']).optional(),
+  skills: z.array(z.string()).optional(),
+  maxActiveLeads: z.number().int().nonnegative().optional(),
+  isAvailable: z.boolean().optional(),
+  avatar: z.string().url().optional(),
+})
+
+const userUpdateSchema = userCreateSchema.partial().extend({
+  password: z.string().min(8).optional(),
+})
+
+app.post('/api/users', authenticate, requireRoles('admin'), async (req, res, next) => {
   try {
-    const clients = await listClients()
-    res.json({ data: clients, total: clients.length })
+    const payload = userCreateSchema.parse(req.body)
+    const email = payload.email.toLowerCase()
+
+    if (isMongoReady()) {
+      const existing = await User.findOne({ email })
+      if (existing) return res.status(409).json({ message: 'A user with this email already exists' })
+      const user = await User.create({
+        ...payload,
+        email,
+        passwordHash: bcrypt.hashSync(payload.password, 12),
+        lastActive: new Date(),
+      })
+      const serialized = serializeUser(user)
+      await writeActivity('user.created', 'auth', serialized.id, { role: serialized.role }, req.user)
+      return res.status(201).json({ data: serialized })
+    }
+
+    if (store.users.find((u) => u.email.toLowerCase() === email)) {
+      return res.status(409).json({ message: 'A user with this email already exists' })
+    }
+    const user = {
+      id: randomUUID(),
+      ...payload,
+      email,
+      passwordHash: bcrypt.hashSync(payload.password, 12),
+      createdAt: new Date().toISOString(),
+      lastActive: new Date().toISOString(),
+    }
+    store.users.push(user)
+    await writeActivity('user.created', 'auth', user.id, { role: user.role }, req.user)
+    return res.status(201).json({ data: sanitizeUser(user) })
+  } catch (error) {
+    return next(error)
+  }
+})
+
+app.patch('/api/users/:id', authenticate, requireRoles('admin'), async (req, res, next) => {
+  try {
+    const updates = userUpdateSchema.parse(req.body)
+    const patch = { ...updates }
+    if (updates.password) {
+      patch.passwordHash = bcrypt.hashSync(updates.password, 12)
+      delete patch.password
+    }
+    if (updates.email) patch.email = updates.email.toLowerCase()
+
+    if (isMongoReady()) {
+      const saved = await User.findByIdAndUpdate(req.params.id, patch, { new: true })
+      if (!saved) return res.status(404).json({ message: 'User not found' })
+      await writeActivity('user.updated', 'auth', req.params.id, Object.keys(updates), req.user)
+      return res.json({ data: serializeUser(saved) })
+    }
+
+    const user = store.users.find((u) => u.id === req.params.id)
+    if (!user) return res.status(404).json({ message: 'User not found' })
+    Object.assign(user, patch)
+    await writeActivity('user.updated', 'auth', user.id, Object.keys(updates), req.user)
+    return res.json({ data: sanitizeUser(user) })
+  } catch (error) {
+    return next(error)
+  }
+})
+
+app.delete('/api/users/:id', authenticate, requireRoles('admin'), async (req, res, next) => {
+  try {
+    if (req.user.sub === req.params.id) {
+      return res.status(400).json({ message: 'You cannot delete your own account while signed in.' })
+    }
+    if (isMongoReady()) {
+      const deleted = await User.findByIdAndUpdate(req.params.id, { status: 'inactive' }, { new: true })
+      if (!deleted) return res.status(404).json({ message: 'User not found' })
+    } else {
+      const user = store.users.find((u) => u.id === req.params.id)
+      if (!user) return res.status(404).json({ message: 'User not found' })
+      user.status = 'inactive'
+    }
+
+    await writeActivity('user.deactivated', 'auth', req.params.id, {}, req.user)
+    return res.json({ success: true })
+  } catch (error) {
+    return next(error)
+  }
+})
+
+app.get('/api/clients', authenticate, async (req, res, next) => {
+  try {
+    const result = await listClients(req.query)
+    res.json(result)
   } catch (error) {
     next(error)
   }
@@ -1305,10 +2030,10 @@ app.post('/api/clients/:id/messages', authenticate, requireRoles('admin', 'manag
   }
 })
 
-app.get('/api/deals', authenticate, async (_req, res, next) => {
+app.get('/api/deals', authenticate, async (req, res, next) => {
   try {
-    const deals = await listDeals()
-    res.json({ data: deals, total: deals.length })
+    const result = await listDeals(req.query)
+    res.json(result)
   } catch (error) {
     next(error)
   }
@@ -1372,10 +2097,10 @@ app.delete('/api/deals/:id', authenticate, requireRoles('admin', 'manager'), asy
   }
 })
 
-app.get('/api/tasks', authenticate, async (_req, res, next) => {
+app.get('/api/tasks', authenticate, async (req, res, next) => {
   try {
-    const tasks = await listTasks()
-    res.json({ data: tasks, total: tasks.length })
+    const result = await listTasks(req.query)
+    res.json(result)
   } catch (error) {
     next(error)
   }
@@ -1388,12 +2113,26 @@ app.post('/api/tasks', authenticate, requireRoles('admin', 'manager', 'sales'), 
       const task = await Task.create(payload)
       const serialized = serializeRecord(task)
       await writeActivity('task.created', 'task', serialized.id, {}, req.user)
+      if (serialized.assignedTo && serialized.assignedTo !== req.user.id) {
+        notifyUserPush(serialized.assignedTo, {
+          title: 'New task assigned',
+          body: serialized.title || 'You have a new task',
+          url: '/tasks',
+        })
+      }
       return res.status(201).json({ data: serialized })
     }
 
     const task = { id: req.body.id || randomUUID(), createdAt: new Date().toISOString(), ...payload }
     store.tasks.unshift(task)
     await writeActivity('task.created', 'task', task.id, {}, req.user)
+    if (task.assignedTo && task.assignedTo !== req.user.id) {
+      notifyUserPush(task.assignedTo, {
+        title: 'New task assigned',
+        body: task.title || 'You have a new task',
+        url: '/tasks',
+      })
+    }
     return res.status(201).json({ data: task })
   } catch (error) {
     return next(error)
@@ -1441,8 +2180,157 @@ app.delete('/api/tasks/:id', authenticate, requireRoles('admin', 'manager'), asy
 
 app.get('/api/leads', authenticate, async (req, res, next) => {
   try {
-    const data = await listLeads(req.query)
-    res.json({ data, total: data.length })
+    const result = await listLeads(req.query)
+    res.json(result)
+  } catch (error) {
+    next(error)
+  }
+})
+
+const LEAD_CSV_COLUMNS = [
+  { key: 'id', label: 'id' },
+  { key: 'name', label: 'name' },
+  { key: 'email', label: 'email' },
+  { key: 'phone', label: 'phone' },
+  { key: 'company', label: 'company' },
+  { key: 'source', label: 'source' },
+  { key: 'status', label: 'status' },
+  { key: 'segment', label: 'segment' },
+  { key: 'priority', label: 'priority' },
+  { key: 'score', label: 'score' },
+  { key: 'value', label: 'value' },
+  { key: 'budget', label: 'budget' },
+  { key: 'interestLevel', label: 'interestLevel' },
+  { key: 'engagementLevel', label: 'engagementLevel' },
+  { key: 'assignedUserName', label: 'assignedUserName' },
+  { key: 'department', label: 'department' },
+  { key: 'tags', label: 'tags', get: (r) => (Array.isArray(r.tags) ? r.tags.join('|') : r.tags || '') },
+  { key: 'city', label: 'city', get: (r) => r.location?.city || '' },
+  { key: 'country', label: 'country', get: (r) => r.location?.country || '' },
+  { key: 'notes', label: 'notes' },
+  { key: 'lastActivity', label: 'lastActivity' },
+  { key: 'nextFollowUp', label: 'nextFollowUp' },
+  { key: 'createdAt', label: 'createdAt' },
+]
+
+app.get('/api/leads/export.csv', authenticate, requireRoles('admin', 'manager', 'sales'), async (req, res, next) => {
+  try {
+    // Use same filters as list endpoint, but ignore pagination so the export
+    // returns the full filtered set.
+    const { limit, offset, page, ...filters } = req.query
+    const result = await listLeads(filters)
+    const csv = rowsToCsv(result.data, LEAD_CSV_COLUMNS)
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8')
+    res.setHeader('Content-Disposition', `attachment; filename="leads-${new Date().toISOString().slice(0, 10)}.csv"`)
+    res.send(csv)
+  } catch (error) {
+    next(error)
+  }
+})
+
+const bulkImportSchema = z.object({
+  csv: z.string().min(1).optional(),
+  rows: z.array(z.record(z.any())).optional(),
+}).refine((value) => Boolean(value.csv || value.rows), {
+  message: 'Provide either "csv" text or a "rows" array',
+})
+
+app.post('/api/leads/import', authenticate, requireRoles('admin', 'manager'), async (req, res, next) => {
+  try {
+    const payload = bulkImportSchema.parse(req.body)
+    const rows = payload.rows || parseCsv(payload.csv).rows
+    const created = []
+    const merged = []
+    const failed = []
+
+    for (const [index, raw] of rows.entries()) {
+      try {
+        const tags = raw.tags
+          ? Array.isArray(raw.tags)
+            ? raw.tags
+            : String(raw.tags).split(/[|,]/).map((t) => t.trim()).filter(Boolean)
+          : undefined
+
+        const candidate = {
+          name: raw.name || raw.fullName || raw['Full Name'] || '',
+          email: raw.email || undefined,
+          phone: raw.phone || raw.mobile || undefined,
+          company: raw.company || raw.organization || undefined,
+          source: raw.source || 'manual',
+          status: raw.status || undefined,
+          notes: raw.notes || undefined,
+          assignedTo: raw.assignedTo || undefined,
+          priority: raw.priority || undefined,
+          department: raw.department || undefined,
+          requiredSkill: raw.requiredSkill || undefined,
+          tags,
+          budget: raw.budget ? Number(raw.budget) : undefined,
+          interestLevel: raw.interestLevel || undefined,
+          engagementLevel: raw.engagementLevel || undefined,
+          location: (raw.city || raw.country || raw.state)
+            ? { city: raw.city, country: raw.country, state: raw.state }
+            : undefined,
+        }
+
+        const parsed = leadSchema.parse(candidate)
+        const before = await findLeadByIdentity({ phone: parsed.phone, email: parsed.email })
+        const lead = await createLead(parsed, req.user)
+        if (before && before.id === lead.id) {
+          merged.push({ row: index + 2, id: lead.id })
+        } else {
+          created.push({ row: index + 2, id: lead.id })
+        }
+      } catch (error) {
+        failed.push({
+          row: index + 2,
+          error: error instanceof z.ZodError ? error.issues : (error.message || 'Unknown error'),
+        })
+      }
+    }
+
+    await writeActivity('lead.bulk_import', 'lead', 'bulk', {
+      created: created.length,
+      merged: merged.length,
+      failed: failed.length,
+    }, req.user)
+
+    return res.json({
+      summary: { total: rows.length, created: created.length, merged: merged.length, failed: failed.length },
+      created,
+      merged,
+      failed,
+    })
+  } catch (error) {
+    return next(error)
+  }
+})
+
+const CLIENT_CSV_COLUMNS = [
+  { key: 'id', label: 'id' },
+  { key: 'name', label: 'name' },
+  { key: 'company', label: 'company' },
+  { key: 'email', label: 'email' },
+  { key: 'phone', label: 'phone' },
+  { key: 'industry', label: 'industry' },
+  { key: 'status', label: 'status' },
+  { key: 'segment', label: 'segment' },
+  { key: 'healthScore', label: 'healthScore' },
+  { key: 'lifetimeValue', label: 'lifetimeValue' },
+  { key: 'totalDeals', label: 'totalDeals' },
+  { key: 'accountOwnerName', label: 'accountOwnerName' },
+  { key: 'lastContact', label: 'lastContact' },
+  { key: 'renewalDate', label: 'renewalDate' },
+  { key: 'createdAt', label: 'createdAt' },
+]
+
+app.get('/api/clients/export.csv', authenticate, requireRoles('admin', 'manager', 'sales'), async (req, res, next) => {
+  try {
+    const { limit, offset, page, ...filters } = req.query
+    const result = await listClients(filters)
+    const csv = rowsToCsv(result.data, CLIENT_CSV_COLUMNS)
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8')
+    res.setHeader('Content-Disposition', `attachment; filename="clients-${new Date().toISOString().slice(0, 10)}.csv"`)
+    res.send(csv)
   } catch (error) {
     next(error)
   }
@@ -1630,7 +2518,7 @@ app.post('/api/leads/:id/messages', authenticate, requireRoles('admin', 'manager
 app.get('/api/calls', authenticate, async (_req, res, next) => {
   try {
     if (isMongoReady()) {
-      const leads = await listLeads()
+      const { data: leads } = await listLeads()
       const calls = leads.flatMap((lead) => (lead.callLogs || []).map((call) => ({ leadId: lead.id, leadName: lead.name, ...call })))
       return res.json({ data: calls, total: calls.length })
     }
@@ -1644,7 +2532,7 @@ app.get('/api/calls', authenticate, async (_req, res, next) => {
 app.get('/api/messages', authenticate, async (_req, res, next) => {
   try {
     if (isMongoReady()) {
-      const leads = await listLeads()
+      const { data: leads } = await listLeads()
       const messages = leads.flatMap((lead) => (lead.messages || []).map((message) => ({ leadId: lead.id, leadName: lead.name, ...message })))
       return res.json({ data: messages, total: messages.length })
     }
@@ -1655,7 +2543,7 @@ app.get('/api/messages', authenticate, async (_req, res, next) => {
   }
 })
 
-app.post('/api/capture/forms', async (req, res, next) => {
+app.post('/api/capture/forms', captureRateLimiter, async (req, res, next) => {
   try {
     const payload = leadSchema.parse({
       ...req.body,
@@ -1693,7 +2581,7 @@ app.get('/api/webhooks/meta-ads', (req, res) => {
   return res.status(403).send('Verification failed')
 })
 
-app.post('/api/webhooks/meta-ads', async (req, res, next) => {
+app.post('/api/webhooks/meta-ads', webhookRateLimiter, verifyMetaSignature, async (req, res, next) => {
   try {
     const leadgenId = req.body.leadgen_id || req.body.entry?.[0]?.changes?.[0]?.value?.leadgen_id
     const externalLead = leadgenId ? await fetchMetaLead(leadgenId) : req.body
@@ -1723,7 +2611,7 @@ app.post('/api/webhooks/meta-ads', async (req, res, next) => {
   }
 })
 
-app.post('/api/webhooks/ivr', async (req, res, next) => {
+app.post('/api/webhooks/ivr', webhookRateLimiter, verifyTwilioSignature, async (req, res, next) => {
   try {
     let lead = (req.body.leadId ? await findLead(req.body.leadId) : null) || await findLeadByPhone(req.body.from || req.body.phone)
 
@@ -1800,7 +2688,7 @@ app.get('/api/webhooks/whatsapp', (req, res) => {
   return res.status(403).send('Verification failed')
 })
 
-app.post('/api/webhooks/whatsapp', async (req, res, next) => {
+app.post('/api/webhooks/whatsapp', webhookRateLimiter, verifyWhatsAppSignature, async (req, res, next) => {
   try {
     let lead = (req.body.leadId ? await findLead(req.body.leadId) : null) || await findLeadByPhone(req.body.from || req.body.phone)
 
@@ -1905,9 +2793,11 @@ connectMongo()
 const isServerless = Boolean(process.env.VERCEL) || process.env.SERVERLESS === '1'
 
 if (!isServerless) {
-  app.listen(PORT, () => {
+  const httpServer = app.listen(PORT, () => {
     console.log(`Lead management API listening on http://localhost:${PORT}`)
   })
+  attachRealtime(httpServer)
+  console.log('Realtime WebSocket endpoint available at ws://localhost:' + PORT + '/api/realtime')
 }
 
 export default app
