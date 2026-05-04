@@ -466,9 +466,88 @@ async function ensureBootstrapAdmin() {
   return serializeUser(user)
 }
 
+// Demo seed: one user per role, created on first boot when SEED_DEMO_USERS=1.
+// Safe to leave on — `findOneAndUpdate` with upsert is idempotent and only
+// creates accounts that do not already exist. Disable in production by
+// removing the env flag.
+const DEMO_USERS = [
+  {
+    email: 'superadmin@nexus.crm',
+    name: 'Super Admin',
+    password: 'SuperAdmin@2026',
+    role: 'admin',
+    department: 'enterprise',
+    skills: ['admin', 'security', 'billing'],
+    maxActiveLeads: 200,
+  },
+  {
+    email: 'admin@nexus.crm',
+    name: 'CRM Admin',
+    password: 'Admin@2026',
+    role: 'admin',
+    department: 'enterprise',
+    skills: ['admin'],
+    maxActiveLeads: 100,
+  },
+  {
+    email: 'manager@nexus.crm',
+    name: 'Sales Manager',
+    password: 'Manager@2026',
+    role: 'manager',
+    department: 'inbound',
+    skills: ['coaching', 'reporting'],
+    maxActiveLeads: 80,
+  },
+  {
+    email: 'sales@nexus.crm',
+    name: 'Sales Executive',
+    password: 'Sales@2026',
+    role: 'sales',
+    department: 'outbound',
+    skills: ['cold-calling', 'demos'],
+    maxActiveLeads: 50,
+  },
+  {
+    email: 'viewer@nexus.crm',
+    name: 'Read-only Viewer',
+    password: 'Viewer@2026',
+    role: 'viewer',
+    department: 'support',
+    skills: [],
+    maxActiveLeads: 0,
+  },
+]
+
+let demoSeedRan = false
+async function ensureDemoUsers() {
+  if (demoSeedRan) return
+  if (process.env.SEED_DEMO_USERS !== '1') return
+  if (!isMongoReady()) return
+  demoSeedRan = true
+  for (const u of DEMO_USERS) {
+    const email = u.email.toLowerCase()
+    const existing = await User.findOne({ email })
+    if (existing) continue
+    await User.create({
+      name: u.name,
+      email,
+      passwordHash: bcrypt.hashSync(u.password, 12),
+      role: u.role,
+      status: 'active',
+      department: u.department,
+      skills: u.skills,
+      maxActiveLeads: u.maxActiveLeads,
+      isAvailable: true,
+      lastActive: new Date(),
+    })
+    console.log(`[seed] Created demo user: ${email} (${u.role})`)
+  }
+}
+
 async function listUsers() {
   if (isMongoReady()) {
     await ensureBootstrapAdmin()
+    await ensureDemoUsers()
     const users = await User.find({ status: 'active' }).sort({ createdAt: 1 }).lean()
     return users.map(serializeUser)
   }
@@ -1698,6 +1777,7 @@ app.post('/api/auth/login', authRateLimiter, async (req, res, next) => {
 
     if (isMongoReady()) {
       await ensureBootstrapAdmin()
+      await ensureDemoUsers()
       user = await User.findOne({ email: email.toLowerCase(), status: 'active' }).lean()
     } else {
       user = store.users.find((item) => item.email.toLowerCase() === email.toLowerCase())
